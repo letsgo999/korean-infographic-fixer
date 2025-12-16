@@ -1,3 +1,2 @@
-# 수정된 packages.txt 파일 내용
 tesseract-ocr
-# tesseract-ocr-kor
+tesseract-ocr-kor
