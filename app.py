@@ -309,7 +309,7 @@ def render_step2_detect():
             st.rerun()
 
 def render_step3_edit():
-    """Step 3: 텍스트 편집 (폰트 선택 및 장평 조절 기능 추가)"""
+    """Step 3: 텍스트 편집 (폰트 정렬 및 기본값 14px, 80% 적용)"""
     st.header("✏️ Step 3: 텍스트 편집")
     
     if not st.session_state.text_regions:
@@ -319,14 +319,17 @@ def render_step3_edit():
     image = st.session_state.original_image
     regions = st.session_state.text_regions
     
-    # fonts 폴더의 폰트 파일 목록 읽어오기
+    # fonts 폴더 읽기 및 정렬
     fonts_dir = os.path.join(os.path.dirname(__file__), 'fonts')
     if not os.path.exists(fonts_dir):
         os.makedirs(fonts_dir)
         
-    available_fonts = [f for f in os.listdir(fonts_dir) if f.lower().endswith('.ttf')]
+    # [변경] sorted()를 추가하여 파일명 순서대로(Black, Bold, Regular...) 정렬
+    available_fonts = sorted([f for f in os.listdir(fonts_dir) if f.lower().endswith('.ttf')])
+    
     if not available_fonts:
-        st.error("fonts 폴더에 .ttf 폰트 파일이 없습니다!")
+        # 파일이 없을 경우 경고 (업로드 실패 시 이 메시지가 뜰 수 있음)
+        st.warning("⚠️ fonts 폴더에 폰트 파일이 없습니다. GitHub에 업로드했는지 확인하세요.")
         available_fonts = ["Default"]
 
     col1, col2 = st.columns([1, 1])
@@ -346,27 +349,25 @@ def render_step3_edit():
             display_text = region['text'][:30] + "..." if len(region['text']) > 30 else region['text']
             
             with st.expander(f"📝 {i+1}. {display_text}", expanded=False):
-                # 수정 텍스트 입력
                 edited = st.text_area("수정된 텍스트", value=st.session_state.edited_texts.get(region_id, region['text']), key=f"text_{region_id}_{i}", height=80)
                 
-                # --- [UI 업데이트] 3단 레이아웃 (폰트선택 / 크기 / 장평) ---
                 c1, c2, c3 = st.columns([2, 1, 1])
                 
                 with c1:
-                    # 폰트 파일 선택 (기본값: 기존 설정 or 첫번째 폰트)
                     current_font = region.get('font_filename', available_fonts[0])
                     if current_font not in available_fonts: current_font = available_fonts[0]
-                    
                     selected_font = st.selectbox("폰트 선택", options=available_fonts, index=available_fonts.index(current_font), key=f"font_{region_id}_{i}")
                 
                 with c2:
-                    font_size = st.number_input("크기", min_value=8, max_value=200, value=int(region.get('suggested_font_size', 16)), key=f"size_{region_id}_{i}")
+                    # [변경] 기본값 14 (이미 ocr_engine에서 설정했지만 UI 강제 적용)
+                    default_size = int(region.get('suggested_font_size', 14))
+                    font_size = st.number_input("크기", min_value=8, max_value=200, value=default_size, key=f"size_{region_id}_{i}")
                     
                 with c3:
-                    # 장평 조절 슬라이더 (50% ~ 150%)
-                    width_scale = st.number_input("장평(%)", min_value=50, max_value=200, value=int(region.get('width_scale', 100)), step=5, key=f"scale_{region_id}_{i}")
+                    # [변경] 기본값 80% (장평)
+                    default_scale = int(region.get('width_scale', 80))
+                    width_scale = st.number_input("장평(%)", min_value=50, max_value=200, value=default_scale, step=5, key=f"scale_{region_id}_{i}")
 
-                # 글자색
                 text_color = st.color_picker("글자색", value=region.get('text_color', '#333333'), key=f"color_{region_id}_{i}")
                 
                 if st.button("💾 저장", key=f"save_{region_id}_{i}"):
@@ -376,8 +377,8 @@ def render_step3_edit():
                             r['text'] = edited
                             r['suggested_font_size'] = font_size
                             r['text_color'] = text_color
-                            r['font_filename'] = selected_font # 폰트 저장
-                            r['width_scale'] = width_scale     # 장평 저장
+                            r['font_filename'] = selected_font
+                            r['width_scale'] = width_scale
                             break
                     st.success("저장되었습니다!")
                     st.rerun()
@@ -398,8 +399,8 @@ def render_step3_edit():
                 if new_text:
                     from modules import create_manual_region
                     new_region = create_manual_region(x=x, y=y, width=width, height=height, text=new_text)
-                    # 수동 영역 기본값 설정
                     new_region.font_filename = available_fonts[0]
+                    # 수동 추가 시에도 기본값 14, 80 적용됨 (create_manual_region 수정분 반영)
                     st.session_state.text_regions.append(new_region.to_dict())
                     st.success("추가됨!"); st.rerun()
 
