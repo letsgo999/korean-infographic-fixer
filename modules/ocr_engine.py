@@ -1,6 +1,6 @@
 """
 OCR Engine Module
-텍스트 추출 및 좌표 인식을 담당하는 핵심 모듈 (Defaults Updated: Size 14, Width 80%)
+텍스트 추출, 좌표 인식 및 [행간 겹침 방지]가 적용된 핵심 모듈
 """
 import cv2
 import numpy as np
@@ -19,14 +19,14 @@ class TextRegion:
     is_inverted: bool = False
     style_tag: str = "body"
     
-    # [설정 변경] 기본 폰트 크기 14, 기본 장평 80%
+    # 기본값 설정
     suggested_font_size: int = 14  
     text_color: str = "#000000"
     bg_color: str = "#FFFFFF"
     
     font_family: str = "Noto Sans KR"
     font_filename: str = None
-    width_scale: int = 80  # [설정 변경] 장평 기본값 80
+    width_scale: int = 80
     
     font_weight: str = "Regular"
     is_manual: bool = False
@@ -36,9 +36,6 @@ class TextRegion:
     
     def to_dict(self) -> Dict:
         return asdict(self)
-
-# ... (이하 OCREngine 클래스부터 끝까지는 기존 코드와 동일하므로 유지)
-# 아래 내용은 복사 편의를 위해 전체를 다시 적어드립니다.
 
 class OCREngine:
     def __init__(self, lang: str = "kor+eng", min_confidence: int = 50):
@@ -154,11 +151,43 @@ def merge_regions_by_row(regions: List[TextRegion]) -> List[TextRegion]:
             id="merged", text=full_text, confidence=avg_conf, bounds={'x': min_x, 'y': min_y, 'width': max_x - min_x, 'height': max_y - min_y}, is_inverted=row_group[0].is_inverted
         )
         merged_rows.append(new_region)
-    merged_rows.sort(key=lambda r: (r.bounds['y'], r.bounds['x']))
-    for i, r in enumerate(merged_rows):
+    return merged_rows
+
+def prevent_vertical_overlaps(regions: List[TextRegion], buffer: int = 2) -> List[TextRegion]:
+    """
+    [핵심 기능] 박스들이 수직으로 겹치지 않도록 강제 조정합니다.
+    윗 박스의 바닥이 아랫 박스의 천장을 침범하면, 윗 박스 높이를 줄입니다.
+    """
+    if not regions:
+        return []
+        
+    # Y 좌표 순으로 정렬 (위 -> 아래)
+    regions.sort(key=lambda r: r.bounds['y'])
+    
+    for i in range(len(regions) - 1):
+        current = regions[i]
+        next_reg = regions[i+1]
+        
+        # 현재 박스의 바닥 좌표
+        curr_bottom = current.bounds['y'] + current.bounds['height']
+        # 다음 박스의 천장 좌표
+        next_top = next_reg.bounds['y']
+        
+        # 겹침 발생 확인 (바닥이 천장보다 아래에 있거나, 너무 딱 붙어있는 경우)
+        if curr_bottom >= next_top:
+            # 겹치지 않게 할 새로운 높이 계산 (다음 박스 천장보다 buffer만큼 위)
+            new_height = (next_top - buffer) - current.bounds['y']
+            
+            # 높이가 너무 작아지면(오류 방지) 최소값 10 유지, 아니면 적용
+            if new_height > 10:
+                current.bounds['height'] = int(new_height)
+                
+    # ID 재할당 및 반환
+    for i, r in enumerate(regions):
         prefix = "inv" if r.is_inverted else "ocr"
         r.id = f"{prefix}_{i:03d}"
-    return merged_rows
+        
+    return regions
 
 def run_enhanced_ocr(image: np.ndarray) -> Dict:
     ocr_engine = OCREngine(); inv_detector = InvertedRegionDetector()
@@ -168,16 +197,23 @@ def run_enhanced_ocr(image: np.ndarray) -> Dict:
     for region_bounds in dark_regions:
         inv_texts = ocr_engine.extract_from_inverted_region(image, region_bounds)
         inverted_regions.extend(inv_texts)
+    
     all_raw_regions = normal_regions + inverted_regions
-    final_regions = merge_regions_by_row(all_raw_regions)
+    
+    # 1. 행 단위로 합치기
+    merged_regions = merge_regions_by_row(all_raw_regions)
+    
+    # 2. [NEW] 수직 겹침 강제 해결 (Self-Check Logic)
+    final_regions = prevent_vertical_overlaps(merged_regions)
+    
     final_normal = [r for r in final_regions if not r.is_inverted]
     final_inverted = [r for r in final_regions if r.is_inverted]
+    
     return {'normal_regions': final_normal, 'inverted_regions': final_inverted, 'all_regions': final_regions, 'image_info': {'width': image.shape[1], 'height': image.shape[0]}}
 
 def group_regions_by_lines(regions: List[TextRegion]) -> List[TextRegion]: return regions
 
 def create_manual_region(x: int, y: int, width: int, height: int, text: str, style_tag: str = "body") -> TextRegion:
-    # [설정 변경] 수동 생성 시에도 14px, 80% 적용
     return TextRegion(
         id=f"manual_{int(x)}_{int(y)}", text=text, confidence=100.0, 
         bounds={'x': x, 'y': y, 'width': width, 'height': height}, 
