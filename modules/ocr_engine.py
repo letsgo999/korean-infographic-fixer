@@ -1,14 +1,14 @@
 """
 OCR Engine Module
-텍스트 추출 및 좌표 인식을 담당하는 핵심 모듈 (Final Polish with NMS)
+텍스트 추출 및 좌표 인식을 담당하는 핵심 모듈 (Noise Filter & Line Force Merge Version)
 """
 import cv2
 import numpy as np
 from PIL import Image
 import pytesseract
-from typing import List, Dict, Tuple, Optional
-from dataclasses import dataclass, field, asdict
-import math
+from typing import List, Dict
+from dataclasses import dataclass, asdict
+import re
 
 @dataclass
 class TextRegion:
@@ -16,7 +16,7 @@ class TextRegion:
     id: str
     text: str
     confidence: float
-    bounds: Dict[str, int]  # x, y, width, height
+    bounds: Dict[str, int]
     is_inverted: bool = False
     style_tag: str = "body"
     suggested_font_size: int = 16
@@ -32,23 +32,20 @@ class TextRegion:
     def to_dict(self) -> Dict:
         return asdict(self)
 
-
 class OCREngine:
-    """OCR 엔진 클래스"""
-    
-    def __init__(self, lang: str = "kor+eng", min_confidence: int = 30):
+    def __init__(self, lang: str = "kor+eng", min_confidence: int = 50): # 신뢰도 기준 50으로 상향
         self.lang = lang
         self.min_confidence = min_confidence
         
     def extract_text_regions(self, image: np.ndarray) -> List[TextRegion]:
-        """이미지에서 텍스트 영역 추출 (PSM 6 적용)"""
         if len(image.shape) == 3:
             image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         else:
             image_rgb = image
             
         pil_image = Image.fromarray(image_rgb)
-        # 뭉쳐서 읽기
+        
+        # psm 6: 단일 텍스트 블록으로 간주 (파편화 최소화 시도)
         custom_config = r'--oem 3 --psm 6'
         
         try:
@@ -59,11 +56,7 @@ class OCREngine:
                 output_type=pytesseract.Output.DICT
             )
         except:
-            ocr_data = pytesseract.image_to_data(
-                pil_image, 
-                lang=self.lang, 
-                output_type=pytesseract.Output.DICT
-            )
+            return []
         
         regions = []
         n_boxes = len(ocr_data['text'])
@@ -72,9 +65,10 @@ class OCREngine:
             text = ocr_data['text'][i].strip()
             conf = int(ocr_data['conf'][i])
             
-            if text and conf >= self.min_confidence:
+            # [노이즈 필터 1] 신뢰도 체크 및 유효 텍스트 검증
+            if conf >= self.min_confidence and is_valid_text(text):
                 region = TextRegion(
-                    id=f"ocr_{len(regions):03d}",
+                    id=f"raw_{len(regions)}",
                     text=text,
                     confidence=conf,
                     bounds={
@@ -83,21 +77,13 @@ class OCREngine:
                         'width': ocr_data['width'][i],
                         'height': ocr_data['height'][i]
                     },
-                    block_num=ocr_data['block_num'][i],
-                    line_num=ocr_data['line_num'][i],
                     is_inverted=False
                 )
                 regions.append(region)
                 
         return regions
     
-    def extract_from_inverted_region(
-        self, 
-        image: np.ndarray, 
-        region_bounds: Dict[str, int],
-        padding: int = 5
-    ) -> List[TextRegion]:
-        """역상(반전) 영역에서 텍스트 추출"""
+    def extract_from_inverted_region(self, image: np.ndarray, region_bounds: Dict[str, int], padding: int = 5) -> List[TextRegion]:
         x, y = region_bounds['x'], region_bounds['y']
         w, h = region_bounds['width'], region_bounds['height']
         
@@ -115,7 +101,7 @@ class OCREngine:
             inverted_rgb = inverted_roi
             
         pil_roi = Image.fromarray(inverted_rgb)
-        custom_config = r'--oem 3 --psm 7'
+        custom_config = r'--oem 3 --psm 7' # 한 줄로 인식 유도
         
         try:
             ocr_data = pytesseract.image_to_data(
@@ -125,11 +111,7 @@ class OCREngine:
                 output_type=pytesseract.Output.DICT
             )
         except:
-            ocr_data = pytesseract.image_to_data(
-                pil_roi,
-                lang=self.lang,
-                output_type=pytesseract.Output.DICT
-            )
+            return []
         
         regions = []
         n_boxes = len(ocr_data['text'])
@@ -138,9 +120,9 @@ class OCREngine:
             text = ocr_data['text'][i].strip()
             conf = int(ocr_data['conf'][i])
             
-            if text and conf >= self.min_confidence:
+            if conf >= self.min_confidence and is_valid_text(text):
                 region = TextRegion(
-                    id=f"inv_{len(regions):03d}",
+                    id=f"inv_raw_{len(regions)}",
                     text=text,
                     confidence=conf,
                     bounds={
@@ -155,17 +137,8 @@ class OCREngine:
                 
         return regions
 
-
 class InvertedRegionDetector:
-    """역상 텍스트 영역 감지 클래스"""
-    
-    def __init__(
-        self,
-        dark_threshold: int = 150,
-        min_area: int = 1000,
-        min_width: int = 40,
-        min_height: int = 15
-    ):
+    def __init__(self, dark_threshold=150, min_area=1000, min_width=40, min_height=15):
         self.dark_threshold = dark_threshold
         self.min_area = min_area
         self.min_width = min_width
@@ -196,119 +169,115 @@ class InvertedRegionDetector:
                 
         return regions
 
-
-def smart_merge_regions(regions: List[TextRegion], x_tolerance: int = 60, y_tolerance: int = 20) -> List[TextRegion]:
-    """물리적 거리가 가까운 영역 병합"""
-    if not regions:
-        return []
-
-    sorted_regions = sorted(regions, key=lambda r: (r.bounds['y'] // y_tolerance, r.bounds['x']))
-    
-    merged = []
-    current = sorted_regions[0]
-    
-    for next_reg in sorted_regions[1:]:
-        curr_b = current.bounds
-        next_b = next_reg.bounds
-        
-        y_diff = abs(curr_b['y'] - next_b['y'])
-        h_diff = abs(curr_b['height'] - next_b['height'])
-        is_same_line = y_diff < y_tolerance and h_diff < (max(curr_b['height'], next_b['height']) * 0.7)
-        
-        x_dist = next_b['x'] - (curr_b['x'] + curr_b['width'])
-        is_close_x = -15 < x_dist < x_tolerance
-        
-        is_same_type = current.is_inverted == next_reg.is_inverted
-
-        if is_same_line and is_close_x and is_same_type:
-            new_x = min(curr_b['x'], next_b['x'])
-            new_y = min(curr_b['y'], next_b['y'])
-            new_w = max(curr_b['x'] + curr_b['width'], next_b['x'] + next_b['width']) - new_x
-            new_h = max(curr_b['y'] + curr_b['height'], next_b['y'] + next_b['height']) - new_y
-            
-            combined_text = f"{current.text} {next_reg.text}".strip()
-            new_conf = (current.confidence + next_reg.confidence) / 2
-            
-            current = TextRegion(
-                id=current.id,
-                text=combined_text,
-                confidence=new_conf,
-                bounds={'x': new_x, 'y': new_y, 'width': new_w, 'height': new_h},
-                is_inverted=current.is_inverted,
-                word_count=current.word_count + next_reg.word_count
-            )
-        else:
-            merged.append(current)
-            current = next_reg
-            
-    merged.append(current)
-    return merged
-
-def remove_overlapping_regions(regions: List[TextRegion], overlap_threshold: float = 0.5) -> List[TextRegion]:
+def is_valid_text(text: str) -> bool:
     """
-    [핵심 추가 기능] 
-    다른 영역에 포함되거나 겹치는 '작은 영역'을 제거합니다.
-    큰 박스가 작은 박스를 삼키는 방식입니다.
+    [핵심 필터] 그래픽 노이즈(아이콘 등)를 걸러냅니다.
+    1. 빈 문자열 제외
+    2. 특수문자로만 구성된 경우 제외
+    3. 길이가 1인데 한글/숫자가 아닌 경우(영어 낱글자 등) 제외
+    """
+    t = text.strip()
+    if not t: return False
+    
+    # 1. 특수문자만 있는 경우 (예: "===", "---") 제거
+    # 한글(가-힣), 영문(a-zA-Z), 숫자(0-9)가 하나라도 없으면 노이즈
+    if not re.search(r'[가-힣a-zA-Z0-9]', t):
+        return False
+        
+    # 2. 길이가 짧은데 영어/특수문자인 경우 (아이콘 오인)
+    # 한글은 1글자라도 의미가 있을 수 있으나, 영어 낱글자(i, l 등)는 보통 노이즈
+    if len(t) == 1 and re.match(r'[a-zA-Z\W]', t):
+        # 예외: A, I 같은 대문자는 살릴 수도 있으나 인포그래픽에선 보통 단어임.
+        # 안전하게 1글자 영문은 버림.
+        return False
+        
+    return True
+
+def merge_regions_by_row(regions: List[TextRegion], y_threshold: int = 15) -> List[TextRegion]:
+    """
+    [핵심 병합] Y좌표가 유사한 영역들을 하나의 '행(Row)'으로 강제 통합합니다.
+    X좌표 거리가 멀어도 같은 줄에 있으면 합칩니다.
     """
     if not regions:
         return []
         
-    # 면적 기준 내림차순 정렬 (큰 박스부터 처리)
-    sorted_regions = sorted(regions, key=lambda r: r.bounds['width'] * r.bounds['height'], reverse=True)
-    keep_indices = [True] * len(sorted_regions)
+    # Y 좌표(Top) 기준으로 정렬
+    regions.sort(key=lambda r: r.bounds['y'])
     
-    for i in range(len(sorted_regions)):
-        if not keep_indices[i]:
-            continue
-            
-        r1 = sorted_regions[i]
-        b1 = r1.bounds
-        area1 = b1['width'] * b1['height']
+    merged_rows = []
+    
+    while regions:
+        current = regions.pop(0)
         
-        for j in range(i + 1, len(sorted_regions)):
-            if not keep_indices[j]:
-                continue
+        # 현재 영역의 중심 Y 좌표
+        current_cy = current.bounds['y'] + current.bounds['height'] // 2
+        
+        # 같은 행으로 볼 후보들 찾기
+        row_group = [current]
+        others = []
+        
+        for r in regions:
+            r_cy = r.bounds['y'] + r.bounds['height'] // 2
+            
+            # 높이 차이가 크지 않으면 같은 줄로 간주
+            # 기준: 두 영역 중 더 큰 높이의 50% 이내로 중심이 차이나면 같은 줄
+            height_ref = max(current.bounds['height'], r.bounds['height'])
+            
+            if abs(current_cy - r_cy) < (height_ref * 0.5):
+                row_group.append(r)
+            else:
+                others.append(r)
                 
-            r2 = sorted_regions[j]
-            b2 = r2.bounds
-            area2 = b2['width'] * b2['height']
-            
-            # 교집합(겹치는 부분) 계산
-            x_left = max(b1['x'], b2['x'])
-            y_top = max(b1['y'], b2['y'])
-            x_right = min(b1['x'] + b1['width'], b2['x'] + b2['width'])
-            y_bottom = min(b1['y'] + b1['height'], b2['y'] + b2['height'])
-            
-            if x_right > x_left and y_bottom > y_top:
-                intersection_area = (x_right - x_left) * (y_bottom - y_top)
-                
-                # 작은 박스(r2)의 50% 이상이 큰 박스(r1)에 포함되면 제거
-                if intersection_area > (area2 * overlap_threshold):
-                    keep_indices[j] = False
-                    
-    # 살아남은 영역만 필터링 및 ID 재할당
-    final_regions = []
-    for i, keep in enumerate(keep_indices):
-        if keep:
-            final_regions.append(sorted_regions[i])
-            
-    # Y 좌표 순으로 다시 정렬 (사용자 편의)
-    final_regions.sort(key=lambda r: (r.bounds['y'], r.bounds['x']))
-    
-    # ID 재할당
-    for i, r in enumerate(final_regions):
+        regions = others # 처리 안 된 것들만 남김
+        
+        # 찾은 row_group을 하나로 합치기
+        # X 좌표 순으로 정렬
+        row_group.sort(key=lambda r: r.bounds['x'])
+        
+        # 좌표 계산
+        min_x = min(r.bounds['x'] for r in row_group)
+        min_y = min(r.bounds['y'] for r in row_group)
+        max_x = max(r.bounds['x'] + r.bounds['width'] for r in row_group)
+        max_y = max(r.bounds['y'] + r.bounds['height'] for r in row_group)
+        
+        # 텍스트 합치기
+        full_text = " ".join([r.text for r in row_group])
+        
+        # 평균 신뢰도
+        avg_conf = sum(r.confidence for r in row_group) / len(row_group)
+        
+        new_region = TextRegion(
+            id="merged", # 나중에 재할당
+            text=full_text,
+            confidence=avg_conf,
+            bounds={
+                'x': min_x, 
+                'y': min_y, 
+                'width': max_x - min_x, 
+                'height': max_y - min_y
+            },
+            is_inverted=row_group[0].is_inverted
+        )
+        merged_rows.append(new_region)
+        
+    # ID 재할당 및 정렬
+    merged_rows.sort(key=lambda r: (r.bounds['y'], r.bounds['x']))
+    for i, r in enumerate(merged_rows):
         prefix = "inv" if r.is_inverted else "ocr"
         r.id = f"{prefix}_{i:03d}"
         
-    return final_regions
-
+    return merged_rows
 
 def run_enhanced_ocr(image: np.ndarray) -> Dict:
-    """향상된 OCR 파이프라인 (NMS 포함)"""
+    """
+    향상된 OCR 파이프라인 (노이즈 제거 -> 행 강제 통합)
+    """
     ocr_engine = OCREngine()
     inv_detector = InvertedRegionDetector()
     
+    # 1. 추출 (여기서 이미 is_valid_text 필터 작동)
     normal_regions = ocr_engine.extract_text_regions(image)
+    
     dark_regions = inv_detector.detect(image)
     inverted_regions = []
     for region_bounds in dark_regions:
@@ -317,11 +286,8 @@ def run_enhanced_ocr(image: np.ndarray) -> Dict:
     
     all_raw_regions = normal_regions + inverted_regions
     
-    # 1. 뭉치기 (Merge)
-    merged_regions = smart_merge_regions(all_raw_regions)
-    
-    # 2. 겹치는 것 제거 (NMS) - 여기서 중복 박스가 사라집니다!
-    final_regions = remove_overlapping_regions(merged_regions)
+    # 2. 행 단위 강제 통합 (Fragmentation 해결)
+    final_regions = merge_regions_by_row(all_raw_regions)
     
     final_normal = [r for r in final_regions if not r.is_inverted]
     final_inverted = [r for r in final_regions if r.is_inverted]
@@ -335,7 +301,6 @@ def run_enhanced_ocr(image: np.ndarray) -> Dict:
             'height': image.shape[0]
         }
     }
-
 
 def group_regions_by_lines(regions: List[TextRegion]) -> List[TextRegion]:
     """호환성 유지 함수"""
