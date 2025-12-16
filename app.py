@@ -7,7 +7,7 @@ import os
 import tempfile
 from datetime import datetime
 from pathlib import Path
-import uuid # [NEW] 강제 새로고침을 위한 키 생성용
+import uuid
 
 # [필수] 캔버스 라이브러리
 from streamlit_drawable_canvas import st_canvas
@@ -37,14 +37,11 @@ def init_session_state():
     if 'edited_texts' not in st.session_state:
         st.session_state.edited_texts = {}
     if 'canvas_key' not in st.session_state:
-        st.session_state.canvas_key = "canvas_v1" # 캔버스 리셋용 키
+        st.session_state.canvas_key = "canvas_v1"
 
-# [핵심 최적화 1] 이미지 처리 함수 캐싱 (매번 연산하지 않음)
-@st.cache_data
 def process_image_for_display(image_array, max_width=800):
     """
-    이미지를 화면에 표시하기 좋게 리사이징하고 PIL 형식으로 변환합니다.
-    이 결과는 캐시에 저장되어 멈춤 현상을 방지합니다.
+    이미지 리사이징 함수 (캐시 제거됨 - 배경 이미지 오류 해결)
     """
     h_orig, w_orig = image_array.shape[:2]
     scale_factor = 1.0
@@ -121,7 +118,7 @@ def render_step1_upload():
             st.rerun()
 
 def render_step2_detect():
-    """Step 2: 수동 영역 지정 (캐싱 및 안정성 강화 버전)"""
+    """Step 2: 수동 영역 지정 (이미지 표시 오류 수정)"""
     st.header("Step 2: 텍스트 영역 지정")
     
     if st.session_state.original_image is None:
@@ -130,11 +127,11 @@ def render_step2_detect():
 
     original_image = st.session_state.original_image
     
-    # [최적화] 캐시된 함수로 이미지 처리 (렉 방지)
+    # 이미지 처리 (캐시 없이 직접 호출)
     try:
         pil_image, scale_factor, new_width, new_height = process_image_for_display(original_image)
-        # 디버깅 정보: 이미지가 제대로 계산되었는지 확인
-        st.caption(f"ℹ️ 이미지 로드 완료: {new_width}x{new_height}px (원본 비율 {scale_factor:.2f})")
+        # 캡션으로 해상도 확인
+        st.caption(f"ℹ️ 편집 해상도: {new_width}x{new_height} (원본 비율: {scale_factor:.2f})")
     except Exception as e:
         st.error(f"이미지 처리 중 오류 발생: {e}")
         return
@@ -143,9 +140,8 @@ def render_step2_detect():
 
     col_reset, _ = st.columns([1, 4])
     with col_reset:
-        # [핵심] 멈췄을 때 뚫어주는 버튼
-        if st.button("🔄 캔버스 강제 새로고침"):
-            st.session_state.canvas_key = f"canvas_{uuid.uuid4()}" # 키를 변경하여 컴포넌트 재로드
+        if st.button("🔄 캔버스 초기화"):
+            st.session_state.canvas_key = f"canvas_{uuid.uuid4()}" 
             st.rerun()
 
     # 캔버스 호출
@@ -154,12 +150,12 @@ def render_step2_detect():
             fill_color="rgba(255, 165, 0, 0.2)",
             stroke_width=2,
             stroke_color="#FF0000",
-            background_image=pil_image,
+            background_image=pil_image, # 여기서 PIL 이미지가 직접 들어감
             update_streamlit=True,
             height=new_height,
             width=new_width,
             drawing_mode="rect",
-            key=st.session_state.canvas_key, # 동적 키 사용
+            key=st.session_state.canvas_key,
             display_toolbar=True
         )
     except Exception as e:
@@ -184,7 +180,6 @@ def render_step2_detect():
                         w = int(obj["width"] * scale_factor)
                         h = int(obj["height"] * scale_factor)
                         
-                        # 좌표 유효성 검사
                         x = max(0, min(x, w_orig))
                         y = max(0, min(y, h_orig))
                         w = min(w, w_orig - x)
@@ -196,10 +191,10 @@ def render_step2_detect():
                         region = extract_text_from_crop(original_image, x, y, w, h)
                         region.id = f"manual_{i:03d}"
                         
-                        # [요청하신 기본값 적용]
+                        # [기본값 적용: 16px, 90%, Black]
                         region.suggested_font_size = 16
                         region.width_scale = 90
-                        region.font_filename = "NotoSansKR-Black.ttf"
+                        region.font_filename = "NotoSansKR-Bold.ttf"
                         
                         regions.append(region.to_dict())
                     
@@ -246,12 +241,17 @@ def render_step3_edit():
                 with c1:
                     curr_font = region.get('font_filename', available_fonts[0])
                     if curr_font not in available_fonts: curr_font = available_fonts[0]
-                    selected_font = st.selectbox("폰트", options=available_fonts, index=available_fonts.index(curr_font), key=f"font_{region_id}_{i}")
+                    # 기본 폰트가 목록에 없으면 첫번째꺼 선택
+                    try:
+                        idx = available_fonts.index(curr_font)
+                    except ValueError:
+                        idx = 0
+                    selected_font = st.selectbox("폰트", options=available_fonts, index=idx, key=f"font_{region_id}_{i}")
                 with c2:
-                    curr_size = int(region.get('suggested_font_size', 14))
+                    curr_size = int(region.get('suggested_font_size', 16))
                     font_size = st.number_input("크기", min_value=5, max_value=200, value=curr_size, key=f"size_{region_id}_{i}")
                 with c3:
-                    curr_scale = int(region.get('width_scale', 80))
+                    curr_scale = int(region.get('width_scale', 90))
                     width_scale = st.number_input("장평(%)", min_value=50, max_value=200, value=curr_scale, step=5, key=f"scale_{region_id}_{i}")
                 
                 curr_color = region.get('text_color', '#333333')
@@ -308,11 +308,11 @@ def render_step4_export(settings: dict):
             bounds=r['bounds'],
             is_inverted=r.get('is_inverted', False),
             is_manual=True,
-            suggested_font_size=r.get('suggested_font_size', 14),
+            suggested_font_size=r.get('suggested_font_size', 16),
             text_color=r.get('text_color', '#000000'),
             bg_color=r.get('bg_color', '#FFFFFF'),
             font_filename=r.get('font_filename', None),
-            width_scale=r.get('width_scale', 80)
+            width_scale=r.get('width_scale', 90)
         )
         target_objects.append(obj)
         
