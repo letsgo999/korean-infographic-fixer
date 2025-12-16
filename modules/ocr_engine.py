@@ -1,6 +1,6 @@
 """
 OCR Engine Module
-텍스트 추출 및 좌표 인식을 담당하는 핵심 모듈 (Final Fix)
+텍스트 추출 및 좌표 인식을 담당하는 핵심 모듈 (Tuned Version)
 """
 import cv2
 import numpy as np
@@ -48,8 +48,6 @@ class OCREngine:
             image_rgb = image
             
         pil_image = Image.fromarray(image_rgb)
-        
-        # 뭉쳐서 읽기 위해 PSM 6 사용
         custom_config = r'--oem 3 --psm 6'
         
         try:
@@ -116,8 +114,6 @@ class OCREngine:
             inverted_rgb = inverted_roi
             
         pil_roi = Image.fromarray(inverted_rgb)
-        
-        # 한 줄 텍스트로 가정 (PSM 7)
         custom_config = r'--oem 3 --psm 7'
         
         try:
@@ -200,8 +196,10 @@ class InvertedRegionDetector:
         return regions
 
 
-def smart_merge_regions(regions: List[TextRegion], x_tolerance: int = 20, y_tolerance: int = 15) -> List[TextRegion]:
-    """물리적 거리가 가까운 텍스트 영역을 하나로 병합"""
+def smart_merge_regions(regions: List[TextRegion], x_tolerance: int = 60, y_tolerance: int = 20) -> List[TextRegion]:
+    """
+    [튜닝됨] x_tolerance를 60으로 늘려 멀리 떨어진 단어도 문장으로 합칩니다.
+    """
     if not regions:
         return []
 
@@ -216,10 +214,12 @@ def smart_merge_regions(regions: List[TextRegion], x_tolerance: int = 20, y_tole
         
         y_diff = abs(curr_b['y'] - next_b['y'])
         h_diff = abs(curr_b['height'] - next_b['height'])
-        is_same_line = y_diff < y_tolerance and h_diff < (max(curr_b['height'], next_b['height']) * 0.5)
+        # 같은 라인 판정 (높이 차이 허용치도 조금 늘림)
+        is_same_line = y_diff < y_tolerance and h_diff < (max(curr_b['height'], next_b['height']) * 0.7)
         
         x_dist = next_b['x'] - (curr_b['x'] + curr_b['width'])
-        is_close_x = -10 < x_dist < x_tolerance
+        # x_tolerance를 60으로 사용
+        is_close_x = -15 < x_dist < x_tolerance
         
         is_same_type = current.is_inverted == next_reg.is_inverted
 
@@ -268,7 +268,7 @@ def run_enhanced_ocr(image: np.ndarray) -> Dict:
     
     all_raw_regions = normal_regions + inverted_regions
     
-    # 여기서 이미 강력한 병합을 수행합니다.
+    # 튜닝된 스마트 병합 실행
     merged_regions = smart_merge_regions(all_raw_regions)
     
     final_normal = [r for r in merged_regions if not r.is_inverted]
@@ -286,10 +286,5 @@ def run_enhanced_ocr(image: np.ndarray) -> Dict:
 
 
 def group_regions_by_lines(regions: List[TextRegion]) -> List[TextRegion]:
-    """
-    [호환성 유지 함수]
-    app.py에서 호출하는 함수입니다.
-    run_enhanced_ocr에서 이미 smart_merge_regions가 수행되었으므로,
-    여기서는 별도의 작업 없이 입력받은 리스트를 그대로 반환합니다.
-    """
+    """호환성 유지 함수"""
     return regions
