@@ -1,8 +1,8 @@
 """
 OCR Engine Module
-[v10 - 공백 3칸 기준] 
+[v10.1 - 공백 3.5칸 기준] 
 1. 행 병합 기본 유지
-2. 수평 트리밍: 3칸 이상 공백에서 끊음 (v6의 2칸 → 3칸으로 상향)
+2. 수평 트리밍: 3.5칸 이상 공백에서 끊음
 """
 import cv2
 import numpy as np
@@ -244,7 +244,7 @@ def refine_vertical_boundaries_by_projection(image: np.ndarray, regions: List[Te
 def find_text_end_by_gap(image: np.ndarray, region: TextRegion) -> int:
     """
     텍스트가 끝나는 지점 찾기
-    3칸 이상 공백이 연속되면 거기서 끊음 (v6: 2칸 → v10: 3칸)
+    3.5칸 이상 공백이 연속되면 거기서 끊음
     """
     binary = get_content_mask(image)
     img_h, img_w = binary.shape
@@ -255,8 +255,8 @@ def find_text_end_by_gap(image: np.ndarray, region: TextRegion) -> int:
     y1 = max(0, region.bounds['y'])
     y2 = min(img_h, region.bounds['y'] + text_h)
     
-    # [v10 변경] 3칸 공백 기준 (텍스트 높이의 2.5배)
-    gap_threshold = int(text_h * 2.5)
+    # [v10.1] 3.5칸 공백 기준
+    gap_threshold = int(text_h * 3.5)
     
     roi = binary[y1:y2, x_start:x_end]
     if roi.size == 0:
@@ -271,27 +271,22 @@ def find_text_end_by_gap(image: np.ndarray, region: TextRegion) -> int:
         abs_x = x_start + i
         
         if col_sum > 0:
-            # 내용 있음
             if gap_start != -1:
                 gap_width = abs_x - gap_start
                 if gap_width >= gap_threshold:
-                    # 3칸 이상 공백 발견 → 공백 시작점에서 끊음
                     return gap_start
             
             last_content_x = abs_x
             gap_start = -1
         else:
-            # 빈 열
             if gap_start == -1:
                 gap_start = abs_x
     
-    # 마지막까지 확인 (끝에 큰 공백이 있는 경우)
     if gap_start != -1:
         gap_width = x_end - gap_start
         if gap_width >= gap_threshold:
             return gap_start
     
-    # 공백 없으면 마지막 내용 위치 + 약간의 여유
     return min(last_content_x + int(text_h * 0.3), x_end)
 
 
@@ -329,8 +324,6 @@ def run_enhanced_ocr(image: np.ndarray) -> Dict:
     all_raw_regions = normal_regions + inverted_regions
     merged_regions = merge_regions_by_row(all_raw_regions)
     vertical_refined = refine_vertical_boundaries_by_projection(image, merged_regions)
-    
-    # 공백 기준으로 오른쪽 경계 트리밍
     final_regions = trim_horizontal_bounds(image, vertical_refined)
     
     final_normal = [r for r in final_regions if not r.is_inverted]
