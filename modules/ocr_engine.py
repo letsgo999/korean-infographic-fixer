@@ -1,16 +1,15 @@
 """
 OCR Engine Module
-[Balanced Version v3] 
-1. 엣지 기반 감지
-2. 픽셀 투영 행 분리
-3. 컨투어 기반 지능형 확장
-4. [BALANCED] 그래픽 보호 - 아이콘/일러스트만 타겟팅
+[v4 - 원점 재설계] 
+1. 행 병합 기본 유지 (같은 Y축 = 같은 행)
+2. 수평 확장 시 "정사각형 덩어리"를 만나면 멈춤
+3. 복잡한 컬러 분석 제거
 """
 import cv2
 import numpy as np
 from PIL import Image
 import pytesseract
-from typing import List, Dict, Tuple
+from typing import List, Dict
 from dataclasses import dataclass, asdict
 import re
 
@@ -39,228 +38,6 @@ class TextRegion:
     
     def to_dict(self) -> Dict:
         return asdict(self)
-
-
-class GraphicProtector:
-    """
-    [v3] 균형 잡힌 그래픽 보호
-    - 소셜 아이콘 그룹만 정확히 타겟팅
-    - 큰 일러스트 영역만 보호
-    - 텍스트는 최대한 보존
-    """
-    
-    def __init__(self):
-        self.protected_regions: List[Dict] = []
-        self.mask: np.ndarray = None
-    
-    def detect_and_protect(self, image: np.ndarray, padding: int = 5) -> np.ndarray:
-        h, w = image.shape[:2]
-        self.mask = np.zeros((h, w), dtype=np.uint8)
-        self.protected_regions = []
-        
-        # 1. 소셜 아이콘 그룹 감지 (가장 중요)
-        icon_groups = self._detect_social_icon_row(image)
-        
-        # 2. 큰 일러스트 영역 감지
-        illustrations = self._detect_large_illustrations(image)
-        
-        all_regions = icon_groups + illustrations
-        
-        # 병합
-        merged = self._merge_nearby_regions(all_regions)
-        self.protected_regions = merged
-        
-        # 마스크에 그리기
-        for region in merged:
-            x = max(0, region['x'] - padding)
-            y = max(0, region['y'] - padding)
-            x2 = min(w, region['x'] + region['width'] + padding)
-            y2 = min(h, region['y'] + region['height'] + padding)
-            self.mask[y:y2, x:x2] = 255
-        
-        return self.mask
-    
-    def _detect_social_icon_row(self, image: np.ndarray) -> List[Dict]:
-        """소셜 미디어 아이콘 행 감지 (인스타, 유튜브, 페이스북 등)"""
-        regions = []
-        
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        
-        # 채도가 높은 작은 사각형들 찾기
-        saturation = hsv[:, :, 1]
-        _, sat_mask = cv2.threshold(saturation, 80, 255, cv2.THRESH_BINARY)
-        
-        # 작은 커널로 노이즈 제거
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        sat_mask = cv2.morphologyEx(sat_mask, cv2.MORPH_OPEN, kernel)
-        
-        contours, _ = cv2.findContours(sat_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # 아이콘 후보 (20~60px 크기의 정사각형에 가까운 것들)
-        icon_candidates = []
-        for cnt in contours:
-            x, y, w, h = cv2.boundingRect(cnt)
-            
-            # 아이콘 크기 범위
-            if 18 <= w <= 70 and 18 <= h <= 70:
-                aspect = w / h if h > 0 else 0
-                # 정사각형에 가까운 것
-                if 0.6 <= aspect <= 1.7:
-                    # 채워진 정도 확인
-                    roi = sat_mask[y:y+h, x:x+w]
-                    fill_ratio = np.sum(roi > 0) / (w * h) if w * h > 0 else 0
-                    if fill_ratio > 0.3:
-                        icon_candidates.append({'x': x, 'y': y, 'width': w, 'height': h})
-        
-        # 수평으로 나열된 아이콘들 그룹화
-        if len(icon_candidates) >= 2:
-            icon_candidates.sort(key=lambda c: (c['y'] // 40, c['x']))
-            
-            current_group = []
-            for cand in icon_candidates:
-                if not current_group:
-                    current_group.append(cand)
-                    continue
-                
-                last = current_group[-1]
-                same_row = abs(cand['y'] - last['y']) < 30
-                gap = cand['x'] - (last['x'] + last['width'])
-                close = 0 < gap < 50
-                
-                if same_row and close:
-                    current_group.append(cand)
-                else:
-                    if len(current_group) >= 2:
-                        regions.append(self._merge_icons(current_group))
-                    current_group = [cand]
-            
-            if len(current_group) >= 2:
-                regions.append(self._merge_icons(current_group))
-        
-        return regions
-    
-    def _detect_large_illustrations(self, image: np.ndarray) -> List[Dict]:
-        """큰 일러스트/캐릭터 영역 감지"""
-        regions = []
-        
-        # 피부색 감지 (YCrCb)
-        ycrcb = cv2.cvtColor(image, cv2.COLOR_BGR2YCrCb)
-        lower_skin = np.array([0, 133, 77], dtype=np.uint8)
-        upper_skin = np.array([255, 173, 127], dtype=np.uint8)
-        skin_mask = cv2.inRange(ycrcb, lower_skin, upper_skin)
-        
-        # 모폴로지로 연결
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (20, 20))
-        skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_CLOSE, kernel)
-        skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (10, 10)))
-        
-        contours, _ = cv2.findContours(skin_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        for cnt in contours:
-            x, y, w, h = cv2.boundingRect(cnt)
-            area = w * h
-            
-            # 큰 영역만 (일러스트는 보통 큼)
-            if area > 3000 and w > 50 and h > 50:
-                aspect = w / h if h > 0 else 0
-                # 너무 길쭉하지 않은 것 (텍스트 배제)
-                if 0.2 < aspect < 5:
-                    regions.append({
-                        'x': x, 'y': y, 'width': w, 'height': h, 'type': 'illustration'
-                    })
-        
-        return regions
-    
-    def _merge_icons(self, icons: List[Dict]) -> Dict:
-        x = min(i['x'] for i in icons)
-        y = min(i['y'] for i in icons)
-        x2 = max(i['x'] + i['width'] for i in icons)
-        y2 = max(i['y'] + i['height'] for i in icons)
-        return {'x': x, 'y': y, 'width': x2 - x, 'height': y2 - y, 'type': 'icon_group'}
-    
-    def _merge_nearby_regions(self, regions: List[Dict]) -> List[Dict]:
-        if len(regions) <= 1:
-            return regions
-        
-        merged = []
-        used = [False] * len(regions)
-        
-        for i, r1 in enumerate(regions):
-            if used[i]:
-                continue
-            
-            current = r1.copy()
-            
-            for j, r2 in enumerate(regions):
-                if i == j or used[j]:
-                    continue
-                
-                # 겹치거나 인접한 영역 병합
-                if self._rects_close(current, r2, margin=20):
-                    current = self._merge_two(current, r2)
-                    used[j] = True
-            
-            merged.append(current)
-            used[i] = True
-        
-        return merged
-    
-    def _rects_close(self, r1: Dict, r2: Dict, margin: int) -> bool:
-        x1_1 = r1['x'] - margin
-        y1_1 = r1['y'] - margin
-        x2_1 = r1['x'] + r1['width'] + margin
-        y2_1 = r1['y'] + r1['height'] + margin
-        
-        x1_2 = r2['x']
-        y1_2 = r2['y']
-        x2_2 = r2['x'] + r2['width']
-        y2_2 = r2['y'] + r2['height']
-        
-        return not (x2_1 < x1_2 or x2_2 < x1_1 or y2_1 < y1_2 or y2_2 < y1_1)
-    
-    def _merge_two(self, r1: Dict, r2: Dict) -> Dict:
-        x = min(r1['x'], r2['x'])
-        y = min(r1['y'], r2['y'])
-        x2 = max(r1['x'] + r1['width'], r2['x'] + r2['width'])
-        y2 = max(r1['y'] + r1['height'], r2['y'] + r2['height'])
-        return {'x': x, 'y': y, 'width': x2 - x, 'height': y2 - y, 'type': 'merged'}
-    
-    def is_protected(self, bounds: Dict[str, int]) -> bool:
-        """영역의 중심점이 보호 영역 안에 있는지 확인"""
-        if self.mask is None:
-            return False
-        
-        # 중심점 계산
-        cx = bounds['x'] + bounds['width'] // 2
-        cy = bounds['y'] + bounds['height'] // 2
-        
-        # 경계 체크
-        if cy < 0 or cy >= self.mask.shape[0] or cx < 0 or cx >= self.mask.shape[1]:
-            return False
-        
-        return self.mask[cy, cx] > 0
-    
-    def clip_bounds_at_protection(self, bounds: Dict[str, int]) -> Dict[str, int]:
-        """보호 영역에서 잘라내기"""
-        if self.mask is None:
-            return bounds
-        
-        x, y, w, h = bounds['x'], bounds['y'], bounds['width'], bounds['height']
-        
-        # 오른쪽에서 보호 영역 찾기
-        for check_x in range(x + w // 2, min(x + w, self.mask.shape[1])):
-            y1 = max(0, y)
-            y2 = min(self.mask.shape[0], y + h)
-            col = self.mask[y1:y2, check_x]
-            
-            # 50% 이상이 보호 영역이면 여기서 자르기
-            if np.sum(col > 0) > len(col) * 0.5:
-                new_w = check_x - x - 3
-                if new_w > 20:
-                    return {'x': x, 'y': y, 'width': new_w, 'height': h}
-                break
-        
-        return bounds
 
 
 class OCREngine:
@@ -362,7 +139,8 @@ def is_valid_text(text: str) -> bool:
     return True
 
 
-def merge_regions_by_row(regions: List[TextRegion], protector: GraphicProtector = None) -> List[TextRegion]:
+def merge_regions_by_row(regions: List[TextRegion]) -> List[TextRegion]:
+    """행 단위 병합 - 같은 Y축 라인은 하나의 행으로"""
     if not regions: return []
     regions.sort(key=lambda r: r.bounds['y'])
     merged_rows = []
@@ -376,29 +154,8 @@ def merge_regions_by_row(regions: List[TextRegion], protector: GraphicProtector 
         for r in regions:
             r_cy = r.bounds['y'] + r.bounds['height'] // 2
             height_ref = max(current.bounds['height'], r.bounds['height'])
-            
             if abs(current_cy - r_cy) < (height_ref * 0.5):
-                # 두 영역 사이에 보호 영역이 있으면 병합 안함
-                should_merge = True
-                
-                if protector is not None:
-                    left = current if current.bounds['x'] < r.bounds['x'] else r
-                    right = r if current.bounds['x'] < r.bounds['x'] else current
-                    gap_start = left.bounds['x'] + left.bounds['width']
-                    gap_end = right.bounds['x']
-                    
-                    if gap_end > gap_start + 20:
-                        # 간격 중간 지점 체크
-                        mid_x = (gap_start + gap_end) // 2
-                        mid_y = (left.bounds['y'] + right.bounds['y']) // 2
-                        test_bounds = {'x': mid_x - 5, 'y': mid_y, 'width': 10, 'height': 10}
-                        if protector.is_protected(test_bounds):
-                            should_merge = False
-                
-                if should_merge:
-                    row_group.append(r)
-                else:
-                    others.append(r)
+                row_group.append(r)
             else:
                 others.append(r)
         
@@ -413,17 +170,11 @@ def merge_regions_by_row(regions: List[TextRegion], protector: GraphicProtector 
         full_text = " ".join([r.text for r in row_group])
         avg_conf = sum(r.confidence for r in row_group) / len(row_group)
         
-        new_bounds = {'x': min_x, 'y': min_y, 'width': max_x - min_x, 'height': max_y - min_y}
-        
-        # 보호 영역에서 클리핑
-        if protector is not None:
-            new_bounds = protector.clip_bounds_at_protection(new_bounds)
-        
         new_region = TextRegion(
             id="merged",
             text=full_text,
             confidence=avg_conf,
-            bounds=new_bounds,
+            bounds={'x': min_x, 'y': min_y, 'width': max_x - min_x, 'height': max_y - min_y},
             is_inverted=row_group[0].is_inverted
         )
         merged_rows.append(new_region)
@@ -491,100 +242,113 @@ def refine_vertical_boundaries_by_projection(image: np.ndarray, regions: List[Te
     return regions
 
 
-def expand_horizontal_bounds(image: np.ndarray, regions: List[TextRegion], protector: GraphicProtector = None, max_lookahead: int = 400) -> List[TextRegion]:
-    if not regions: return []
+def find_right_boundary(image: np.ndarray, region: TextRegion, max_lookahead: int = 500) -> int:
+    """
+    [핵심 함수] 텍스트 행의 오른쪽 끝을 어디서 자를지 결정
     
+    원리: 오른쪽으로 스캔하면서 "정사각형에 가까운 큰 덩어리"를 만나면 그 전에서 멈춤
+    - 텍스트: 가로로 길쭉함 (width >> height)
+    - 아이콘/그림: 정사각형에 가까움 (width ≈ height)
+    """
     binary = get_content_mask(image)
     img_h, img_w = binary.shape
     
-    for r in regions:
-        if r.is_inverted: continue
-        
-        ref_h = r.bounds['height']
-        start_x = r.bounds['x'] + r.bounds['width']
-        
-        y_margin = int(ref_h * 0.2)
-        roi_y1 = max(0, r.bounds['y'] - y_margin)
-        roi_y2 = min(img_h, r.bounds['y'] + r.bounds['height'] + y_margin)
-        roi_x1 = start_x
-        roi_x2 = min(img_w, start_x + max_lookahead)
-        
-        if roi_x2 <= roi_x1: continue
-        
-        roi = binary[roi_y1:roi_y2, roi_x1:roi_x2]
-        contours, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        blob_list = []
-        for cnt in contours:
-            x, y, w, h = cv2.boundingRect(cnt)
-            if w < 3 or h < 3: continue
-            blob_list.append((x, y, w, h))
-        
-        blob_list.sort(key=lambda b: b[0])
-        current_extension = 0
-        
-        for bx, by, bw, bh in blob_list:
-            abs_x = roi_x1 + bx
-            abs_y = roi_y1 + by
-            
-            # 보호 영역 체크
-            if protector is not None:
-                test_bounds = {'x': abs_x, 'y': abs_y, 'width': bw, 'height': bh}
-                if protector.is_protected(test_bounds):
-                    break
-            
-            gap = abs_x - (r.bounds['x'] + r.bounds['width'] + current_extension)
-            if gap > 100: break
-            
-            if bh > (ref_h * 1.5): break
-            
-            blob_center_y = roi_y1 + by + bh/2
-            line_center_y = r.bounds['y'] + r.bounds['height']/2
-            if abs(blob_center_y - line_center_y) > (ref_h * 0.6): break
-            
-            if bw > (ref_h * 3.0): break
-            
-            new_right_edge = abs_x + bw
-            current_w = new_right_edge - r.bounds['x']
-            if current_w > r.bounds['width']:
-                r.bounds['width'] = current_w
-                current_extension = current_w - (start_x - r.bounds['x'])
+    ref_h = region.bounds['height']
+    start_x = region.bounds['x'] + region.bounds['width']
+    y1 = max(0, region.bounds['y'] - 5)
+    y2 = min(img_h, region.bounds['y'] + ref_h + 5)
     
-    # 최종 클리핑
-    if protector is not None:
-        for r in regions:
-            r.bounds = protector.clip_bounds_at_protection(r.bounds)
+    # 탐색 범위
+    search_end = min(img_w, start_x + max_lookahead)
+    
+    if search_end <= start_x:
+        return region.bounds['x'] + region.bounds['width']
+    
+    # 오른쪽 영역에서 컨투어 찾기
+    roi = binary[y1:y2, start_x:search_end]
+    if roi.size == 0:
+        return region.bounds['x'] + region.bounds['width']
+    
+    contours, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # 덩어리들을 왼쪽부터 정렬
+    blobs = []
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w < 5 or h < 5:
+            continue
+        blobs.append({'x': x, 'y': y, 'w': w, 'h': h, 'abs_x': start_x + x})
+    
+    blobs.sort(key=lambda b: b['x'])
+    
+    current_right = region.bounds['x'] + region.bounds['width']
+    
+    for blob in blobs:
+        # 이전 끝과 너무 멀리 떨어져 있으면 (100px 이상 간격) 여기서 끝
+        gap = blob['abs_x'] - current_right
+        if gap > 100:
+            break
+        
+        w, h = blob['w'], blob['h']
+        
+        # [핵심 판단] 정사각형에 가까운 큰 덩어리 = 아이콘/그림
+        aspect_ratio = w / h if h > 0 else 0
+        is_square_ish = 0.5 <= aspect_ratio <= 2.0  # 정사각형에 가까움
+        is_big = w > ref_h * 0.8 and h > ref_h * 0.8  # 텍스트 높이보다 큰 덩어리
+        
+        if is_square_ish and is_big:
+            # 아이콘/그림으로 판단 → 여기서 멈춤
+            break
+        
+        # 텍스트로 판단 → 포함
+        current_right = blob['abs_x'] + w
+    
+    return current_right
+
+
+def expand_horizontal_bounds(image: np.ndarray, regions: List[TextRegion]) -> List[TextRegion]:
+    """행 단위로 오른쪽 경계 확장 (아이콘/그림 전에서 멈춤)"""
+    if not regions:
+        return []
+    
+    for r in regions:
+        if r.is_inverted:
+            continue
+        
+        # 오른쪽 경계 찾기
+        right_x = find_right_boundary(image, r)
+        new_width = right_x - r.bounds['x']
+        
+        if new_width > r.bounds['width']:
+            r.bounds['width'] = new_width
     
     return regions
 
 
 def run_enhanced_ocr(image: np.ndarray) -> Dict:
-    """메인 OCR 함수 - 균형 잡힌 그래픽 보호 적용"""
-    
-    # 1. 그래픽 보호 영역 감지 (아이콘 그룹 + 큰 일러스트만)
-    protector = GraphicProtector()
-    protector.detect_and_protect(image, padding=8)
-    
-    # 2. OCR 수행
+    """메인 OCR 함수"""
     ocr_engine = OCREngine()
     inv_detector = InvertedRegionDetector()
     
+    # 1. OCR로 텍스트 추출
     normal_regions = ocr_engine.extract_text_regions(image)
+    
+    # 2. 역상 영역 처리
     dark_regions = inv_detector.detect(image)
     inverted_regions = []
     for region_bounds in dark_regions:
         inv_texts = ocr_engine.extract_from_inverted_region(image, region_bounds)
         inverted_regions.extend(inv_texts)
     
-    # 3. 영역 병합 (보호 영역 사이는 병합 안함)
+    # 3. 행 단위 병합 (핵심 - 같은 Y축은 하나의 행)
     all_raw_regions = normal_regions + inverted_regions
-    merged_regions = merge_regions_by_row(all_raw_regions, protector)
+    merged_regions = merge_regions_by_row(all_raw_regions)
     
-    # 4. 수직 경계 정제
+    # 4. 수직 경계 정제 (행간 분리)
     vertical_refined = refine_vertical_boundaries_by_projection(image, merged_regions)
     
-    # 5. 수평 확장 (보호 영역에서 멈춤)
-    final_regions = expand_horizontal_bounds(image, vertical_refined, protector)
+    # 5. 수평 확장 (아이콘/그림 전에서 멈춤)
+    final_regions = expand_horizontal_bounds(image, vertical_refined)
     
     final_normal = [r for r in final_regions if not r.is_inverted]
     final_inverted = [r for r in final_regions if r.is_inverted]
