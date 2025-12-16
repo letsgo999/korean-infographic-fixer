@@ -1,9 +1,8 @@
 """
 OCR Engine Module
-[v9 - 수직 연속성 체크] 
+[v10 - 공백 3칸 기준] 
 1. 행 병합 기본 유지
-2. 수평 확장 시 "현재 행의 Y 범위를 벗어나는 픽셀"이 연속되면 끊음
-3. 그림은 여러 행에 걸치므로, 행 범위 밖 픽셀로 감지
+2. 수평 트리밍: 3칸 이상 공백에서 끊음 (v6의 2칸 → 3칸으로 상향)
 """
 import cv2
 import numpy as np
@@ -242,66 +241,24 @@ def refine_vertical_boundaries_by_projection(image: np.ndarray, regions: List[Te
     return regions
 
 
-def has_vertical_overflow(binary: np.ndarray, x: int, text_y: int, text_h: int, check_width: int = 5) -> bool:
+def find_text_end_by_gap(image: np.ndarray, region: TextRegion) -> int:
     """
-    특정 X 위치에서 텍스트 행의 Y 범위를 벗어나는 픽셀이 있는지 확인
-    
-    텍스트: 행 범위 내에만 픽셀 존재
-    그림: 행 범위를 벗어나는 픽셀 존재 (위 또는 아래로 삐져나옴)
+    텍스트가 끝나는 지점 찾기
+    3칸 이상 공백이 연속되면 거기서 끊음 (v6: 2칸 → v10: 3칸)
     """
+    binary = get_content_mask(image)
     img_h, img_w = binary.shape
     
-    if x < 0 or x >= img_w:
-        return False
-    
-    # 체크할 열 범위
-    x_end = min(x + check_width, img_w)
-    
-    # 텍스트 행의 Y 범위 (약간의 여유 포함)
-    margin = max(3, text_h // 4)
-    row_top = text_y - margin
-    row_bottom = text_y + text_h + margin
-    
-    # 행 범위 위쪽 체크 (0 ~ row_top)
-    if row_top > 0:
-        above_roi = binary[0:row_top, x:x_end]
-        if above_roi.size > 0 and np.sum(above_roi > 0) > (above_roi.size * 0.02):
-            return True
-    
-    # 행 범위 아래쪽 체크 (row_bottom ~ img_h)
-    if row_bottom < img_h:
-        below_roi = binary[row_bottom:img_h, x:x_end]
-        if below_roi.size > 0 and np.sum(below_roi > 0) > (below_roi.size * 0.02):
-            return True
-    
-    return False
-
-
-def find_text_end_by_vertical_check(binary: np.ndarray, region: TextRegion) -> int:
-    """
-    [v9 핵심] 수직 연속성 체크로 텍스트 끝점 찾기
-    
-    원리:
-    - 오른쪽으로 스캔하면서 각 열을 체크
-    - "행 범위를 벗어나는 픽셀"이 연속으로 나타나면 = 그림 시작
-    - 그 직전에서 끊음
-    """
-    img_h, img_w = binary.shape
-    
-    text_y = region.bounds['y']
     text_h = region.bounds['height']
     x_start = region.bounds['x']
     x_end = region.bounds['x'] + region.bounds['width']
+    y1 = max(0, region.bounds['y'])
+    y2 = min(img_h, region.bounds['y'] + text_h)
     
-    # 2칸 공백 기준
-    char_width = text_h
-    gap_threshold = int(char_width * 1.5)
+    # [v10 변경] 3칸 공백 기준 (텍스트 높이의 2.5배)
+    gap_threshold = int(text_h * 2.5)
     
-    # 행 범위 내의 ROI
-    row_top = max(0, text_y)
-    row_bottom = min(img_h, text_y + text_h)
-    roi = binary[row_top:row_bottom, x_start:x_end]
-    
+    roi = binary[y1:y2, x_start:x_end]
     if roi.size == 0:
         return x_end
     
@@ -309,63 +266,45 @@ def find_text_end_by_vertical_check(binary: np.ndarray, region: TextRegion) -> i
     
     last_content_x = x_start
     gap_start = -1
-    overflow_start = -1
-    overflow_count = 0
     
     for i, col_sum in enumerate(col_sums):
         abs_x = x_start + i
         
-        # 수직 오버플로우 체크 (행 범위 밖에 픽셀이 있는지)
-        has_overflow = has_vertical_overflow(binary, abs_x, text_y, text_h, check_width=3)
-        
-        if has_overflow:
-            if overflow_start == -1:
-                overflow_start = abs_x
-            overflow_count += 1
-            
-            # 연속 10픽셀 이상 오버플로우 = 그림 영역 확실
-            if overflow_count >= 10:
-                # 오버플로우 시작점 직전에서 끊음
-                return max(last_content_x, overflow_start - 5)
-        else:
-            overflow_start = -1
-            overflow_count = 0
-        
-        # 기존 공백 체크도 유지
         if col_sum > 0:
+            # 내용 있음
             if gap_start != -1:
                 gap_width = abs_x - gap_start
                 if gap_width >= gap_threshold:
+                    # 3칸 이상 공백 발견 → 공백 시작점에서 끊음
                     return gap_start
             
-            if not has_overflow:
-                last_content_x = abs_x
+            last_content_x = abs_x
             gap_start = -1
         else:
+            # 빈 열
             if gap_start == -1:
                 gap_start = abs_x
     
-    # 마지막 공백 체크
+    # 마지막까지 확인 (끝에 큰 공백이 있는 경우)
     if gap_start != -1:
         gap_width = x_end - gap_start
         if gap_width >= gap_threshold:
             return gap_start
     
-    return min(last_content_x + int(char_width * 0.3), x_end)
+    # 공백 없으면 마지막 내용 위치 + 약간의 여유
+    return min(last_content_x + int(text_h * 0.3), x_end)
 
 
 def trim_horizontal_bounds(image: np.ndarray, regions: List[TextRegion]) -> List[TextRegion]:
-    """각 행의 오른쪽 경계를 수직 연속성 + 공백 기준으로 트리밍"""
+    """각 행의 오른쪽 경계를 공백 기준으로 트리밍"""
     if not regions:
         return []
-    
-    binary = get_content_mask(image)
     
     for r in regions:
         if r.is_inverted:
             continue
         
-        right_x = find_text_end_by_vertical_check(binary, r)
+        right_x = find_text_end_by_gap(image, r)
         new_width = right_x - r.bounds['x']
         
         if new_width > 10:
@@ -391,7 +330,7 @@ def run_enhanced_ocr(image: np.ndarray) -> Dict:
     merged_regions = merge_regions_by_row(all_raw_regions)
     vertical_refined = refine_vertical_boundaries_by_projection(image, merged_regions)
     
-    # [v9] 수직 연속성 체크로 트리밍
+    # 공백 기준으로 오른쪽 경계 트리밍
     final_regions = trim_horizontal_bounds(image, vertical_refined)
     
     final_normal = [r for r in final_regions if not r.is_inverted]
