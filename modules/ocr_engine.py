@@ -1,6 +1,6 @@
 """
 OCR Engine Module
-텍스트 추출 및 좌표 인식을 담당하는 핵심 모듈 (With Manual Region Helper)
+텍스트 추출 및 좌표 인식을 담당하는 핵심 모듈 (Data Structure Update)
 """
 import cv2
 import numpy as np
@@ -21,7 +21,12 @@ class TextRegion:
     suggested_font_size: int = 16
     text_color: str = "#000000"
     bg_color: str = "#FFFFFF"
-    font_family: str = "Noto Sans KR"
+    
+    # [NEW] 폰트 파일명과 장평(%) 옵션 추가
+    font_family: str = "Noto Sans KR" 
+    font_filename: str = None  # 구체적인 폰트 파일명 (예: NotoSansKR-Bold.ttf)
+    width_scale: int = 100     # 장평 (기본 100%)
+    
     font_weight: str = "Regular"
     is_manual: bool = False
     block_num: int = 0
@@ -30,6 +35,11 @@ class TextRegion:
     
     def to_dict(self) -> Dict:
         return asdict(self)
+
+# ... (이하 OCREngine, InvertedRegionDetector 등 나머지 클래스와 함수들은 기존과 동일하므로 유지)
+# 기존 코드의 나머지 부분은 그대로 두셔도 됩니다. 
+# 만약 복사가 번거로우시다면, 위 @dataclass 부분만 기존 파일의 앞부분에 덮어쓰셔도 됩니다.
+# 하지만 안전을 위해 아래 전체 코드를 제공합니다.
 
 class OCREngine:
     def __init__(self, lang: str = "kor+eng", min_confidence: int = 50):
@@ -41,20 +51,14 @@ class OCREngine:
             image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         else:
             image_rgb = image
-            
         pil_image = Image.fromarray(image_rgb)
         custom_config = r'--oem 3 --psm 6'
-        
         try:
-            ocr_data = pytesseract.image_to_data(
-                pil_image, lang=self.lang, config=custom_config, output_type=pytesseract.Output.DICT
-            )
+            ocr_data = pytesseract.image_to_data(pil_image, lang=self.lang, config=custom_config, output_type=pytesseract.Output.DICT)
         except:
             return []
-        
         regions = []
         n_boxes = len(ocr_data['text'])
-        
         for i in range(n_boxes):
             text = ocr_data['text'][i].strip()
             conf = int(ocr_data['conf'][i])
@@ -63,12 +67,7 @@ class OCREngine:
                     id=f"raw_{len(regions)}",
                     text=text,
                     confidence=conf,
-                    bounds={
-                        'x': ocr_data['left'][i],
-                        'y': ocr_data['top'][i],
-                        'width': ocr_data['width'][i],
-                        'height': ocr_data['height'][i]
-                    },
+                    bounds={'x': ocr_data['left'][i], 'y': ocr_data['top'][i], 'width': ocr_data['width'][i], 'height': ocr_data['height'][i]},
                     is_inverted=False
                 )
                 regions.append(region)
@@ -77,29 +76,18 @@ class OCREngine:
     def extract_from_inverted_region(self, image: np.ndarray, region_bounds: Dict[str, int], padding: int = 5) -> List[TextRegion]:
         x, y = region_bounds['x'], region_bounds['y']
         w, h = region_bounds['width'], region_bounds['height']
-        x1 = max(0, x - padding)
-        y1 = max(0, y - padding)
-        x2 = min(image.shape[1], x + w + padding)
-        y2 = min(image.shape[0], y + h + padding)
-        
+        x1 = max(0, x - padding); y1 = max(0, y - padding)
+        x2 = min(image.shape[1], x + w + padding); y2 = min(image.shape[0], y + h + padding)
         roi = image[y1:y2, x1:x2].copy()
         inverted_roi = cv2.bitwise_not(roi)
-        
-        if len(inverted_roi.shape) == 3:
-            inverted_rgb = cv2.cvtColor(inverted_roi, cv2.COLOR_BGR2RGB)
-        else:
-            inverted_rgb = inverted_roi
-            
+        if len(inverted_roi.shape) == 3: inverted_rgb = cv2.cvtColor(inverted_roi, cv2.COLOR_BGR2RGB)
+        else: inverted_rgb = inverted_roi
         pil_roi = Image.fromarray(inverted_rgb)
         custom_config = r'--oem 3 --psm 7'
-        
         try:
-            ocr_data = pytesseract.image_to_data(
-                pil_roi, lang=self.lang, config=custom_config, output_type=pytesseract.Output.DICT
-            )
+            ocr_data = pytesseract.image_to_data(pil_roi, lang=self.lang, config=custom_config, output_type=pytesseract.Output.DICT)
         except:
             return []
-        
         regions = []
         n_boxes = len(ocr_data['text'])
         for i in range(n_boxes):
@@ -110,12 +98,7 @@ class OCREngine:
                     id=f"inv_raw_{len(regions)}",
                     text=text,
                     confidence=conf,
-                    bounds={
-                        'x': x1 + ocr_data['left'][i],
-                        'y': y1 + ocr_data['top'][i],
-                        'width': ocr_data['width'][i],
-                        'height': ocr_data['height'][i]
-                    },
+                    bounds={'x': x1 + ocr_data['left'][i], 'y': y1 + ocr_data['top'][i], 'width': ocr_data['width'][i], 'height': ocr_data['height'][i]},
                     is_inverted=True
                 )
                 regions.append(region)
@@ -123,16 +106,11 @@ class OCREngine:
 
 class InvertedRegionDetector:
     def __init__(self, dark_threshold=150, min_area=1000, min_width=40, min_height=15):
-        self.dark_threshold = dark_threshold
-        self.min_area = min_area
-        self.min_width = min_width
-        self.min_height = min_height
-        
+        self.dark_threshold = dark_threshold; self.min_area = min_area; self.min_width = min_width; self.min_height = min_height
     def detect(self, image: np.ndarray) -> List[Dict[str, int]]:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        lower_orange = np.array([5, 100, 100])
-        upper_orange = np.array([25, 255, 255])
+        lower_orange = np.array([5, 100, 100]); upper_orange = np.array([25, 255, 255])
         orange_mask = cv2.inRange(hsv, lower_orange, upper_orange)
         dark_mask = cv2.inRange(gray, 0, self.dark_threshold)
         combined_mask = cv2.bitwise_or(orange_mask, dark_mask)
@@ -161,29 +139,20 @@ def merge_regions_by_row(regions: List[TextRegion]) -> List[TextRegion]:
     while regions:
         current = regions.pop(0)
         current_cy = current.bounds['y'] + current.bounds['height'] // 2
-        row_group = [current]
-        others = []
+        row_group = [current]; others = []
         for r in regions:
             r_cy = r.bounds['y'] + r.bounds['height'] // 2
             height_ref = max(current.bounds['height'], r.bounds['height'])
-            if abs(current_cy - r_cy) < (height_ref * 0.5):
-                row_group.append(r)
-            else:
-                others.append(r)
+            if abs(current_cy - r_cy) < (height_ref * 0.5): row_group.append(r)
+            else: others.append(r)
         regions = others
         row_group.sort(key=lambda r: r.bounds['x'])
-        min_x = min(r.bounds['x'] for r in row_group)
-        min_y = min(r.bounds['y'] for r in row_group)
-        max_x = max(r.bounds['x'] + r.bounds['width'] for r in row_group)
-        max_y = max(r.bounds['y'] + r.bounds['height'] for r in row_group)
+        min_x = min(r.bounds['x'] for r in row_group); min_y = min(r.bounds['y'] for r in row_group)
+        max_x = max(r.bounds['x'] + r.bounds['width'] for r in row_group); max_y = max(r.bounds['y'] + r.bounds['height'] for r in row_group)
         full_text = " ".join([r.text for r in row_group])
         avg_conf = sum(r.confidence for r in row_group) / len(row_group)
         new_region = TextRegion(
-            id="merged",
-            text=full_text,
-            confidence=avg_conf,
-            bounds={'x': min_x, 'y': min_y, 'width': max_x - min_x, 'height': max_y - min_y},
-            is_inverted=row_group[0].is_inverted
+            id="merged", text=full_text, confidence=avg_conf, bounds={'x': min_x, 'y': min_y, 'width': max_x - min_x, 'height': max_y - min_y}, is_inverted=row_group[0].is_inverted
         )
         merged_rows.append(new_region)
     merged_rows.sort(key=lambda r: (r.bounds['y'], r.bounds['x']))
@@ -193,8 +162,7 @@ def merge_regions_by_row(regions: List[TextRegion]) -> List[TextRegion]:
     return merged_rows
 
 def run_enhanced_ocr(image: np.ndarray) -> Dict:
-    ocr_engine = OCREngine()
-    inv_detector = InvertedRegionDetector()
+    ocr_engine = OCREngine(); inv_detector = InvertedRegionDetector()
     normal_regions = ocr_engine.extract_text_regions(image)
     dark_regions = inv_detector.detect(image)
     inverted_regions = []
@@ -205,25 +173,11 @@ def run_enhanced_ocr(image: np.ndarray) -> Dict:
     final_regions = merge_regions_by_row(all_raw_regions)
     final_normal = [r for r in final_regions if not r.is_inverted]
     final_inverted = [r for r in final_regions if r.is_inverted]
-    return {
-        'normal_regions': final_normal,
-        'inverted_regions': final_inverted,
-        'all_regions': final_regions,
-        'image_info': {'width': image.shape[1], 'height': image.shape[0]}
-    }
+    return {'normal_regions': final_normal, 'inverted_regions': final_inverted, 'all_regions': final_regions, 'image_info': {'width': image.shape[1], 'height': image.shape[0]}}
 
-def group_regions_by_lines(regions: List[TextRegion]) -> List[TextRegion]:
-    return regions
+def group_regions_by_lines(regions: List[TextRegion]) -> List[TextRegion]: return regions
 
-# [핵심 추가] 이 함수가 없어서 에러가 났습니다.
 def create_manual_region(x: int, y: int, width: int, height: int, text: str, style_tag: str = "body") -> TextRegion:
-    """수동 영역 생성을 위한 헬퍼 함수"""
     return TextRegion(
-        id=f"manual_{int(x)}_{int(y)}",
-        text=text,
-        confidence=100.0,
-        bounds={'x': x, 'y': y, 'width': width, 'height': height},
-        is_inverted=False,
-        is_manual=True,
-        style_tag=style_tag
+        id=f"manual_{int(x)}_{int(y)}", text=text, confidence=100.0, bounds={'x': x, 'y': y, 'width': width, 'height': height}, is_inverted=False, is_manual=True, style_tag=style_tag
     )
