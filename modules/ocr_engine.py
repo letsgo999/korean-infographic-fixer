@@ -1,6 +1,6 @@
 """
 OCR Engine Module
-텍스트 추출 및 좌표 인식을 담당하는 핵심 모듈 (Enhanced Version)
+텍스트 추출 및 좌표 인식을 담당하는 핵심 모듈 (Final Fix)
 """
 import cv2
 import numpy as np
@@ -41,10 +41,7 @@ class OCREngine:
         self.min_confidence = min_confidence
         
     def extract_text_regions(self, image: np.ndarray) -> List[TextRegion]:
-        """
-        이미지에서 텍스트 영역 추출 (PSM 6 적용)
-        """
-        # BGR -> RGB 변환
+        """이미지에서 텍스트 영역 추출 (PSM 6 적용)"""
         if len(image.shape) == 3:
             image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         else:
@@ -52,7 +49,7 @@ class OCREngine:
             
         pil_image = Image.fromarray(image_rgb)
         
-        # OCR 수행 (PSM 6: 단일 텍스트 블록으로 가정하여 파편화 방지)
+        # 뭉쳐서 읽기 위해 PSM 6 사용
         custom_config = r'--oem 3 --psm 6'
         
         try:
@@ -63,7 +60,6 @@ class OCREngine:
                 output_type=pytesseract.Output.DICT
             )
         except:
-            # 설정 실패시 기본 설정으로 재시도
             ocr_data = pytesseract.image_to_data(
                 pil_image, 
                 lang=self.lang, 
@@ -77,7 +73,6 @@ class OCREngine:
             text = ocr_data['text'][i].strip()
             conf = int(ocr_data['conf'][i])
             
-            # 빈 문자열이나 너무 낮은 신뢰도 제외
             if text and conf >= self.min_confidence:
                 region = TextRegion(
                     id=f"ocr_{len(regions):03d}",
@@ -103,9 +98,7 @@ class OCREngine:
         region_bounds: Dict[str, int],
         padding: int = 5
     ) -> List[TextRegion]:
-        """
-        역상(반전) 영역에서 텍스트 추출 (PSM 7 적용)
-        """
+        """역상(반전) 영역에서 텍스트 추출"""
         x, y = region_bounds['x'], region_bounds['y']
         w, h = region_bounds['width'], region_bounds['height']
         
@@ -124,7 +117,7 @@ class OCREngine:
             
         pil_roi = Image.fromarray(inverted_rgb)
         
-        # 역상 영역은 보통 '한 줄'의 텍스트임 -> PSM 7 (Treat the image as a single text line)
+        # 한 줄 텍스트로 가정 (PSM 7)
         custom_config = r'--oem 3 --psm 7'
         
         try:
@@ -182,7 +175,6 @@ class InvertedRegionDetector:
         self.min_height = min_height
         
     def detect(self, image: np.ndarray) -> List[Dict[str, int]]:
-        # 기존 로직 유지 (HSV + Gray Mask)
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         
@@ -209,53 +201,39 @@ class InvertedRegionDetector:
 
 
 def smart_merge_regions(regions: List[TextRegion], x_tolerance: int = 20, y_tolerance: int = 15) -> List[TextRegion]:
-    """
-    [핵심 기능] 물리적 거리가 가까운 텍스트 영역을 하나로 병합합니다.
-    Tesseract의 line_num에 의존하지 않고 좌표 기반으로 병합합니다.
-    """
+    """물리적 거리가 가까운 텍스트 영역을 하나로 병합"""
     if not regions:
         return []
 
-    # 1. Y축(세로) 기준으로 먼저 정렬 (위에서 아래로)
-    # 같은 줄에 있는 것들끼리 뭉치게 하기 위해 Y좌표가 비슷하면 X좌표로 정렬
     sorted_regions = sorted(regions, key=lambda r: (r.bounds['y'] // y_tolerance, r.bounds['x']))
     
     merged = []
     current = sorted_regions[0]
     
     for next_reg in sorted_regions[1:]:
-        # 현재 박스와 다음 박스의 좌표 비교
         curr_b = current.bounds
         next_b = next_reg.bounds
         
-        # 1. 같은 라인인지 확인 (Y좌표 차이가 허용범위 이내이고, 높이 차이도 크지 않음)
         y_diff = abs(curr_b['y'] - next_b['y'])
         h_diff = abs(curr_b['height'] - next_b['height'])
         is_same_line = y_diff < y_tolerance and h_diff < (max(curr_b['height'], next_b['height']) * 0.5)
         
-        # 2. 옆으로 붙어있는지 확인 (현재 박스의 끝(x+w)과 다음 박스의 시작(x) 사이의 거리)
         x_dist = next_b['x'] - (curr_b['x'] + curr_b['width'])
-        is_close_x = -10 < x_dist < x_tolerance  # 겹치거나(-10) 가까운(tolerance) 경우
+        is_close_x = -10 < x_dist < x_tolerance
         
-        # 3. 같은 속성인지 (일반/역상)
         is_same_type = current.is_inverted == next_reg.is_inverted
 
         if is_same_line and is_close_x and is_same_type:
-            # 병합 실행
             new_x = min(curr_b['x'], next_b['x'])
             new_y = min(curr_b['y'], next_b['y'])
             new_w = max(curr_b['x'] + curr_b['width'], next_b['x'] + next_b['width']) - new_x
             new_h = max(curr_b['y'] + curr_b['height'], next_b['y'] + next_b['height']) - new_y
             
-            # 텍스트 합치기 (한글은 띄어쓰기 중요하므로 거리 보고 판단 가능하지만 여기선 공백 추가)
             combined_text = f"{current.text} {next_reg.text}".strip()
-            
-            # 신뢰도 평균
             new_conf = (current.confidence + next_reg.confidence) / 2
             
-            # 업데이트
             current = TextRegion(
-                id=current.id, # ID 유지
+                id=current.id,
                 text=combined_text,
                 confidence=new_conf,
                 bounds={'x': new_x, 'y': new_y, 'width': new_w, 'height': new_h},
@@ -263,14 +241,11 @@ def smart_merge_regions(regions: List[TextRegion], x_tolerance: int = 20, y_tole
                 word_count=current.word_count + next_reg.word_count
             )
         else:
-            # 병합할 수 없으면 현재 것을 리스트에 넣고, 다음 것을 현재로 설정
             merged.append(current)
             current = next_reg
             
-    # 마지막 남은 요소 추가
     merged.append(current)
     
-    # ID 재할당
     for i, r in enumerate(merged):
         prefix = "inv" if r.is_inverted else "ocr"
         r.id = f"{prefix}_{i:03d}"
@@ -279,29 +254,23 @@ def smart_merge_regions(regions: List[TextRegion], x_tolerance: int = 20, y_tole
 
 
 def run_enhanced_ocr(image: np.ndarray) -> Dict:
-    """
-    향상된 OCR 파이프라인 실행
-    """
+    """향상된 OCR 파이프라인 실행"""
     ocr_engine = OCREngine()
     inv_detector = InvertedRegionDetector()
     
-    # 1. 일반 OCR 추출
     normal_regions = ocr_engine.extract_text_regions(image)
     
-    # 2. 역상 영역 감지 및 OCR
     dark_regions = inv_detector.detect(image)
     inverted_regions = []
     for region_bounds in dark_regions:
         inv_texts = ocr_engine.extract_from_inverted_region(image, region_bounds)
         inverted_regions.extend(inv_texts)
     
-    # 3. 결과 통합
     all_raw_regions = normal_regions + inverted_regions
     
-    # 4. [NEW] 스마트 병합 실행 (여기서 파편화된 텍스트를 붙입니다!)
+    # 여기서 이미 강력한 병합을 수행합니다.
     merged_regions = smart_merge_regions(all_raw_regions)
     
-    # 통계를 위해 분리 (ID 접두사로 구분)
     final_normal = [r for r in merged_regions if not r.is_inverted]
     final_inverted = [r for r in merged_regions if r.is_inverted]
     
@@ -314,3 +283,13 @@ def run_enhanced_ocr(image: np.ndarray) -> Dict:
             'height': image.shape[0]
         }
     }
+
+
+def group_regions_by_lines(regions: List[TextRegion]) -> List[TextRegion]:
+    """
+    [호환성 유지 함수]
+    app.py에서 호출하는 함수입니다.
+    run_enhanced_ocr에서 이미 smart_merge_regions가 수행되었으므로,
+    여기서는 별도의 작업 없이 입력받은 리스트를 그대로 반환합니다.
+    """
+    return regions
