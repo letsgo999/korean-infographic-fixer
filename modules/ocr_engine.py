@@ -1,6 +1,6 @@
 """
 OCR Engine Module
-텍스트 추출 및 좌표 인식을 담당하는 핵심 모듈 (Row Force Merge - Rollback Version)
+텍스트 추출 및 좌표 인식을 담당하는 핵심 모듈 (With Manual Region Helper)
 """
 import cv2
 import numpy as np
@@ -43,7 +43,6 @@ class OCREngine:
             image_rgb = image
             
         pil_image = Image.fromarray(image_rgb)
-        # PSM 6: 단일 블록으로 가정하여 파편화 방지
         custom_config = r'--oem 3 --psm 6'
         
         try:
@@ -59,8 +58,6 @@ class OCREngine:
         for i in range(n_boxes):
             text = ocr_data['text'][i].strip()
             conf = int(ocr_data['conf'][i])
-            
-            # 노이즈 필터 적용
             if conf >= self.min_confidence and is_valid_text(text):
                 region = TextRegion(
                     id=f"raw_{len(regions)}",
@@ -151,7 +148,6 @@ class InvertedRegionDetector:
         return regions
 
 def is_valid_text(text: str) -> bool:
-    """노이즈 필터: 특수문자만 있거나, 의미 없는 1글자 영문 등 제거"""
     t = text.strip()
     if not t: return False
     if not re.search(r'[가-힣a-zA-Z0-9]', t): return False
@@ -159,48 +155,29 @@ def is_valid_text(text: str) -> bool:
     return True
 
 def merge_regions_by_row(regions: List[TextRegion]) -> List[TextRegion]:
-    """
-    [복구된 핵심 기능]
-    Y좌표가 비슷하면 거리나 내용에 상관없이 무조건 하나의 행으로 강제 병합합니다.
-    (9줄 인식 성공 버전)
-    """
-    if not regions:
-        return []
-        
+    if not regions: return []
     regions.sort(key=lambda r: r.bounds['y'])
     merged_rows = []
-    
     while regions:
         current = regions.pop(0)
         current_cy = current.bounds['y'] + current.bounds['height'] // 2
-        
         row_group = [current]
         others = []
-        
         for r in regions:
             r_cy = r.bounds['y'] + r.bounds['height'] // 2
             height_ref = max(current.bounds['height'], r.bounds['height'])
-            
-            # 높이 차이가 크지 않으면 무조건 같은 줄로 간주
             if abs(current_cy - r_cy) < (height_ref * 0.5):
                 row_group.append(r)
             else:
                 others.append(r)
-                
         regions = others
-        
-        # 합치기
         row_group.sort(key=lambda r: r.bounds['x'])
-        
         min_x = min(r.bounds['x'] for r in row_group)
         min_y = min(r.bounds['y'] for r in row_group)
         max_x = max(r.bounds['x'] + r.bounds['width'] for r in row_group)
         max_y = max(r.bounds['y'] + r.bounds['height'] for r in row_group)
-        
-        # 텍스트 단순 연결 (공백 포함)
         full_text = " ".join([r.text for r in row_group])
         avg_conf = sum(r.confidence for r in row_group) / len(row_group)
-        
         new_region = TextRegion(
             id="merged",
             text=full_text,
@@ -209,34 +186,25 @@ def merge_regions_by_row(regions: List[TextRegion]) -> List[TextRegion]:
             is_inverted=row_group[0].is_inverted
         )
         merged_rows.append(new_region)
-        
     merged_rows.sort(key=lambda r: (r.bounds['y'], r.bounds['x']))
     for i, r in enumerate(merged_rows):
         prefix = "inv" if r.is_inverted else "ocr"
         r.id = f"{prefix}_{i:03d}"
-        
     return merged_rows
 
 def run_enhanced_ocr(image: np.ndarray) -> Dict:
     ocr_engine = OCREngine()
     inv_detector = InvertedRegionDetector()
-    
-    # 1. 추출
     normal_regions = ocr_engine.extract_text_regions(image)
     dark_regions = inv_detector.detect(image)
     inverted_regions = []
     for region_bounds in dark_regions:
         inv_texts = ocr_engine.extract_from_inverted_region(image, region_bounds)
         inverted_regions.extend(inv_texts)
-    
     all_raw_regions = normal_regions + inverted_regions
-    
-    # 2. 행 단위 강제 통합 (이전의 성공적인 로직)
     final_regions = merge_regions_by_row(all_raw_regions)
-    
     final_normal = [r for r in final_regions if not r.is_inverted]
     final_inverted = [r for r in final_regions if r.is_inverted]
-    
     return {
         'normal_regions': final_normal,
         'inverted_regions': final_inverted,
@@ -246,3 +214,16 @@ def run_enhanced_ocr(image: np.ndarray) -> Dict:
 
 def group_regions_by_lines(regions: List[TextRegion]) -> List[TextRegion]:
     return regions
+
+# [핵심 추가] 이 함수가 없어서 에러가 났습니다.
+def create_manual_region(x: int, y: int, width: int, height: int, text: str, style_tag: str = "body") -> TextRegion:
+    """수동 영역 생성을 위한 헬퍼 함수"""
+    return TextRegion(
+        id=f"manual_{int(x)}_{int(y)}",
+        text=text,
+        confidence=100.0,
+        bounds={'x': x, 'y': y, 'width': width, 'height': height},
+        is_inverted=False,
+        is_manual=True,
+        style_tag=style_tag
+    )
