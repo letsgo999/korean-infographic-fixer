@@ -1,6 +1,9 @@
 """
 OCR Engine Module
-[Final] Edge-based Detection (색상 무관 경계선 인식) 적용
+[Final Polish] 
+1. 엣지 기반 감지
+2. 픽셀 투영 행 분리
+3. [NEW] 터널 주행 기법(Tunnel Collision)으로 그림 영역 침범 원천 차단
 """
 import cv2
 import numpy as np
@@ -153,129 +156,112 @@ def merge_regions_by_row(regions: List[TextRegion]) -> List[TextRegion]:
     return merged_rows
 
 def get_content_mask(image: np.ndarray) -> np.ndarray:
-    """
-    [핵심 기술] 색상 무관, 경계선(Edge) 기반 콘텐츠 감지 마스크 생성
-    글자 색깔이 무엇이든 '배경과 다르다면' 윤곽선을 잡아냅니다.
-    """
-    # 1. 그레이스케일 변환
-    if len(image.shape) == 3:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = image
-        
-    # 2. 모폴로지 그라디언트 (경계선 추출)
-    # 팽창(Dilation) - 침식(Erosion) = 경계선
+    if len(image.shape) == 3: gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else: gray = image
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     gradient = cv2.morphologyEx(gray, cv2.MORPH_GRADIENT, kernel)
-    
-    # 3. Otsu 이진화 (자동으로 임계값 설정하여 경계선만 흰색으로)
     _, binary = cv2.threshold(gradient, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-    
-    # 4. 노이즈 제거 (아주 작은 점들은 무시)
     kernel_clean = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_clean)
-    
     return binary
 
 def refine_vertical_boundaries_by_projection(image: np.ndarray, regions: List[TextRegion]) -> List[TextRegion]:
-    """[Updated] 경계선 기반 투영으로 세로 영역 정밀 절단"""
     if not regions: return []
-    
-    # [변경] 색상 무관 마스크 사용
     binary = get_content_mask(image)
-    
     regions.sort(key=lambda r: r.bounds['y'])
-    
-    # 1. 개별 박스 최적화 (위아래 여백 제거)
     for r in regions:
         x, y, w, h = r.bounds['x'], r.bounds['y'], r.bounds['width'], r.bounds['height']
-        # 이미지 범위 체크
-        x = max(0, x); y = max(0, y)
-        w = min(w, binary.shape[1] - x); h = min(h, binary.shape[0] - y)
-        
+        x = max(0, x); y = max(0, y); w = min(w, binary.shape[1] - x); h = min(h, binary.shape[0] - y)
         roi = binary[y:y+h, x:x+w]
         if roi.size == 0: continue
-        
         row_sums = np.sum(roi, axis=1)
-        # 픽셀이 조금이라도 있는 행 찾기
         non_empty_rows = np.where(row_sums > 0)[0]
-        
         if len(non_empty_rows) > 0:
-            top_trim = non_empty_rows[0]
-            bottom_trim = non_empty_rows[-1]
-            
-            # 최소 높이 10px 보장 (너무 납작해지는 것 방지)
+            top_trim = non_empty_rows[0]; bottom_trim = non_empty_rows[-1]
             new_h = bottom_trim - top_trim + 1
             if new_h > 10:
-                r.bounds['y'] = y + top_trim
-                r.bounds['height'] = new_h
-
-    # 2. 박스 간 충돌 해결 (Split Line)
+                r.bounds['y'] = y + top_trim; r.bounds['height'] = new_h
     for i in range(len(regions) - 1):
-        upper = regions[i]
-        lower = regions[i+1]
-        
-        u_bottom = upper.bounds['y'] + upper.bounds['height']
-        l_top = lower.bounds['y']
-        
+        upper = regions[i]; lower = regions[i+1]
+        u_bottom = upper.bounds['y'] + upper.bounds['height']; l_top = lower.bounds['y']
         if u_bottom >= l_top - 5:
             search_y_start = upper.bounds['y'] + upper.bounds['height'] // 2
             search_y_end = lower.bounds['y'] + lower.bounds['height'] // 2
-            
-            # 순서가 꼬여서 start가 end보다 크면 스킵
             if search_y_start >= search_y_end: continue
-            
-            x_start = max(upper.bounds['x'], lower.bounds['x'])
-            x_end = min(upper.bounds['x'] + upper.bounds['width'], lower.bounds['x'] + lower.bounds['width'])
-            
+            x_start = max(upper.bounds['x'], lower.bounds['x']); x_end = min(upper.bounds['x'] + upper.bounds['width'], lower.bounds['x'] + lower.bounds['width'])
             if x_end <= x_start: continue
-            
-            # 탐색
             search_roi = binary[search_y_start:search_y_end, x_start:x_end]
             if search_roi.size == 0: continue
-            
             row_sums = np.sum(search_roi, axis=1)
-            # 픽셀 합이 가장 작은(경계선이 없는) 곳 찾기
             min_indices = np.where(row_sums == row_sums.min())[0]
             split_line_local = min_indices[len(min_indices)//2]
             split_line_global = search_y_start + split_line_local
-            
             upper.bounds['height'] = max(10, split_line_global - upper.bounds['y'] - 2)
             old_bottom = lower.bounds['y'] + lower.bounds['height']
             lower.bounds['y'] = split_line_global + 2
             lower.bounds['height'] = max(10, old_bottom - lower.bounds['y'])
-
     for i, r in enumerate(regions):
         prefix = "inv" if r.is_inverted else "ocr"
         r.id = f"{prefix}_{i:03d}"
     return regions
 
 def expand_horizontal_bounds(image: np.ndarray, regions: List[TextRegion], max_lookahead: int = 200, gap_threshold: int = 30) -> List[TextRegion]:
-    """[Updated] 경계선 기반 가로 영역 확장"""
+    """
+    [NEW] 터널 주행 (Tunnel Collision) 방식 적용
+    내 높이(Height)만큼의 터널을 뚫고 전진하되,
+    터널 위아래로 튀어나온 '큰 물체(그림)'가 감지되면 즉시 정지합니다.
+    """
     if not regions: return []
     
-    # [변경] 색상 무관 마스크 사용
+    # 엣지 마스크 생성
     binary = get_content_mask(image)
     img_h, img_w = binary.shape
     
     for r in regions:
         if r.is_inverted: continue
+        
         x, y, w, h = r.bounds['x'], r.bounds['y'], r.bounds['width'], r.bounds['height']
+        
+        # 1. 터널 설정 (위아래로 약간의 여유를 둠, 너무 빡빡하면 노이즈에 걸림)
+        # 텍스트 라인의 위쪽 경계와 아래쪽 경계
+        tunnel_top = max(0, y)
+        tunnel_bottom = min(img_h, y + h)
         
         current_x = x + w
         consecutive_gap = 0
         extended_pixels = 0
         
         while current_x < img_w and extended_pixels < max_lookahead:
-            # 안전한 ROI 슬라이싱
-            y_start = max(0, y)
-            y_end = min(img_h, y+h)
-            if y_start >= y_end: break
-
-            col_roi = binary[y_start:y_end, current_x:current_x+1]
+            # 2. 터널 내부 검사 (In-Tunnel)
+            # 현재 x위치의 터널 내부 픽셀들을 봅니다.
+            col_roi_inner = binary[tunnel_top:tunnel_bottom, current_x:current_x+1]
+            has_content_inside = cv2.countNonZero(col_roi_inner) > 0
             
-            # 경계선(글자)이 있는가?
-            if cv2.countNonZero(col_roi) > 0:
+            # 3. 충돌 감지 (Out-of-Tunnel Check) - 여기가 핵심!
+            # 터널 바로 위(Head)와 바로 아래(Feet)를 검사합니다.
+            # 만약 터널 내부에도 픽셀이 있고, 외부(위/아래)에도 픽셀이 연결되어 있다면? -> 큰 그림이다!
+            
+            # 위쪽 감시 구역 (터널 위 10px)
+            check_top = max(0, tunnel_top - 10)
+            col_roi_upper = binary[check_top:tunnel_top, current_x:current_x+1]
+            
+            # 아래쪽 감시 구역 (터널 아래 10px)
+            check_bottom = min(img_h, tunnel_bottom + 10)
+            col_roi_lower = binary[tunnel_bottom:check_bottom, current_x:current_x+1]
+            
+            has_content_upper = cv2.countNonZero(col_roi_upper) > 0
+            has_content_lower = cv2.countNonZero(col_roi_lower) > 0
+            
+            # [STOP 조건] 
+            # 내용물이 있는데(has_content_inside), 그게 위나 아래로 삐져나와 있다면(upper/lower)
+            # 이것은 텍스트 라인이 아니라 세로로 긴 물체(사람, 아이콘 등)입니다.
+            if has_content_inside and (has_content_upper or has_content_lower):
+                # 단, 아주 미세한 연결(1~2픽셀)은 노이즈일 수 있으니 무시할 수도 있지만,
+                # 안전을 위해 여기서는 발견 즉시 멈춥니다.
+                break
+            
+            # 일반적인 확장 로직
+            if has_content_inside:
                 consecutive_gap = 0
             else:
                 consecutive_gap += 1
@@ -304,6 +290,7 @@ def run_enhanced_ocr(image: np.ndarray) -> Dict:
     all_raw_regions = normal_regions + inverted_regions
     merged_regions = merge_regions_by_row(all_raw_regions)
     vertical_refined = refine_vertical_boundaries_by_projection(image, merged_regions)
+    # [NEW] 터널 충돌 방지 적용
     final_regions = expand_horizontal_bounds(image, vertical_refined)
     
     final_normal = [r for r in final_regions if not r.is_inverted]
