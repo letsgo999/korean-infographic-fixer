@@ -8,20 +8,19 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
-# [NEW] 캔버스 라이브러리 (필수)
+# [필수] 캔버스 라이브러리
 from streamlit_drawable_canvas import st_canvas
 
 # Modules
 from modules import (
     TextRegion,
-    extract_text_from_crop, # 수동 추출 함수
+    extract_text_from_crop,
     apply_styles_and_colors,
     CompositeRenderer,
     MultiFormatExporter,
     MetadataBuilder,
     create_manual_region
 )
-# 인페인터는 Step 4에서 직접 호출
 
 # 페이지 설정
 st.set_page_config(layout="wide", page_title="한글 인포그래픽 교정 도구")
@@ -43,7 +42,6 @@ def draw_regions_on_image(image, regions, edited_texts):
     """미리보기용 이미지에 박스 그리기"""
     vis_image = image.copy()
     for region in regions:
-        # 딕셔너리 호환 처리
         if isinstance(region, dict):
             r_id = region['id']
             bounds = region['bounds']
@@ -57,7 +55,6 @@ def draw_regions_on_image(image, regions, edited_texts):
 
         x, y, w, h = bounds['x'], bounds['y'], bounds['width'], bounds['height']
         
-        # 색상 설정 (수정됨: 마젠타, 기본: 초록/파랑)
         if r_id in edited_texts and edited_texts[r_id] != text:
             color = (255, 0, 255) # 수정됨 (Magenta)
             thickness = 3
@@ -70,10 +67,6 @@ def draw_regions_on_image(image, regions, edited_texts):
             
         cv2.rectangle(vis_image, (x, y), (x + w, y + h), color, thickness)
         
-        # ID 표시
-        label = r_id
-        cv2.putText(vis_image, label, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-        
     return vis_image
 
 def render_step1_upload():
@@ -83,7 +76,6 @@ def render_step1_upload():
     uploaded_file = st.file_uploader("인포그래픽 이미지를 업로드하세요", type=['png', 'jpg', 'jpeg'])
     
     if uploaded_file is not None:
-        # 이미지 로드
         image_bytes = uploaded_file.read()
         image_array = np.frombuffer(image_bytes, np.uint8)
         image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
@@ -98,29 +90,42 @@ def render_step1_upload():
             st.rerun()
 
 def render_step2_detect():
-    """Step 2: 수동 영역 지정 (Canvas Drawing)"""
+    """Step 2: 수동 영역 지정 (기본값 설정 적용: 16px, 90%, Black 폰트)"""
     st.header("Step 2: 텍스트 영역 지정")
     
     if st.session_state.original_image is None:
         st.warning("이미지를 먼저 업로드해주세요.")
         return
 
-    image = st.session_state.original_image
+    original_image = st.session_state.original_image
+    h_orig, w_orig = original_image.shape[:2]
     
-    # 이미지 변환 (BGR -> RGB)
+    # [최적화] 이미지 리사이징 (화면 멈춤 방지)
+    MAX_WIDTH = 800
+    scale_factor = 1.0
+    
+    if w_orig > MAX_WIDTH:
+        scale_factor = w_orig / MAX_WIDTH
+        new_width = MAX_WIDTH
+        new_height = int(h_orig / (w_orig / MAX_WIDTH))
+        display_image = cv2.resize(original_image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+    else:
+        display_image = original_image
+        new_width = w_orig
+        new_height = h_orig
+
     try:
-        if len(image.shape) == 3:
-            img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        if len(display_image.shape) == 3:
+            img_rgb = cv2.cvtColor(display_image, cv2.COLOR_BGR2RGB)
         else:
-            img_rgb = image
+            img_rgb = display_image
         pil_image = Image.fromarray(img_rgb)
     except Exception as e:
         st.error(f"이미지 변환 오류: {e}")
         return
 
-    st.info("🖱️ 수정하고 싶은 텍스트 영역을 마우스로 드래그하여 박스를 그려주세요.")
+    st.info(f"🖱️ 마우스로 수정할 텍스트 영역을 박스로 그려주세요.")
 
-    # 캔버스 (수동 영역 지정)
     try:
         canvas_result = st_canvas(
             fill_color="rgba(255, 165, 0, 0.2)",
@@ -128,10 +133,10 @@ def render_step2_detect():
             stroke_color="#FF0000",
             background_image=pil_image,
             update_streamlit=True,
-            height=image.shape[0],
-            width=image.shape[1],
+            height=new_height,
+            width=new_width,
             drawing_mode="rect",
-            key="canvas_manual",
+            key="canvas_optimized_v2", # 키 변경으로 캔버스 리프레시 유도
             display_toolbar=True
         )
     except Exception as e:
@@ -150,28 +155,34 @@ def render_step2_detect():
                     st.rerun()
             
             with col2:
-                # [핵심] 수동 지정 영역 OCR 수행 및 이동
                 if st.button("📝 텍스트 추출 및 편집하기", type="primary"):
-                    with st.spinner("지정된 영역의 텍스트를 읽어오는 중..."):
+                    with st.spinner("텍스트 분석 및 기본값 적용 중..."):
                         regions = []
                         for i, obj in enumerate(objects):
-                            # 좌표 보정
-                            x = int(max(0, obj["left"]))
-                            y = int(max(0, obj["top"]))
-                            w = int(min(image.shape[1] - x, obj["width"]))
-                            h = int(min(image.shape[0] - y, obj["height"]))
+                            # 좌표 복원
+                            x = int(obj["left"] * scale_factor)
+                            y = int(obj["top"] * scale_factor)
+                            w = int(obj["width"] * scale_factor)
+                            h = int(obj["height"] * scale_factor)
+                            
+                            x = max(0, min(x, w_orig))
+                            y = max(0, min(y, h_orig))
+                            w = min(w, w_orig - x)
+                            h = min(h, h_orig - y)
                             
                             if w < 5 or h < 5: continue
 
-                            # OCR 수행
-                            region = extract_text_from_crop(image, x, y, w, h)
-                            
-                            # ID 부여
+                            # 1. 텍스트 추출
+                            region = extract_text_from_crop(original_image, x, y, w, h)
                             region.id = f"manual_{i:03d}"
                             
-                            # 기본 스타일 설정 (이전 대화에서 정한 값)
-                            region.suggested_font_size = 16
-                            region.width_scale = 90
+                            # -------------------------------------------------------
+                            # [핵심 변경] 요청하신 기본값 적용
+                            # -------------------------------------------------------
+                            region.suggested_font_size = 16                 # 기본 크기 16
+                            region.width_scale = 90                         # 기본 장평 90%
+                            region.font_filename = "NotoSansKR-Bold.ttf"   # 기본 폰트 Black
+                            # -------------------------------------------------------
                             
                             regions.append(region.to_dict())
                         
@@ -180,7 +191,7 @@ def render_step2_detect():
                         st.rerun()
 
 def render_step3_edit():
-    """Step 3: 텍스트 편집 (폰트/장평 설정 포함)"""
+    """Step 3: 텍스트 편집"""
     st.header("✏️ Step 3: 텍스트 편집")
     
     if not st.session_state.text_regions:
@@ -190,7 +201,7 @@ def render_step3_edit():
     image = st.session_state.original_image
     regions = st.session_state.text_regions
     
-    # 폰트 폴더 스캔
+    # 폰트 로드
     fonts_dir = os.path.join(os.path.dirname(__file__), 'fonts')
     if not os.path.exists(fonts_dir):
         os.makedirs(fonts_dir)
@@ -204,40 +215,30 @@ def render_step3_edit():
     
     with col1:
         st.subheader("📋 텍스트 영역 목록")
-        
-        # 리스트 출력
         for i, region in enumerate(regions):
             region_id = region['id']
-            # 긴 텍스트 말줄임
             display_text = region['text'][:30] + "..." if len(region['text']) > 30 else region['text']
             
-            with st.expander(f"📝 {i+1}. {display_text}", expanded=False):
-                # 텍스트 수정
+            with st.expander(f"📝 {i+1}. {display_text}", expanded=True):
                 current_text = st.session_state.edited_texts.get(region_id, region['text'])
                 edited = st.text_area("텍스트 내용", value=current_text, key=f"text_{region_id}_{i}", height=70)
                 
-                # 스타일 설정 (3단)
                 c1, c2, c3 = st.columns([2, 1, 1])
                 with c1:
-                    # 폰트 선택
                     curr_font = region.get('font_filename', available_fonts[0])
                     if curr_font not in available_fonts: curr_font = available_fonts[0]
                     selected_font = st.selectbox("폰트", options=available_fonts, index=available_fonts.index(curr_font), key=f"font_{region_id}_{i}")
                 with c2:
-                    # 크기
                     curr_size = int(region.get('suggested_font_size', 14))
                     font_size = st.number_input("크기", min_value=5, max_value=200, value=curr_size, key=f"size_{region_id}_{i}")
                 with c3:
-                    # 장평
                     curr_scale = int(region.get('width_scale', 80))
                     width_scale = st.number_input("장평(%)", min_value=50, max_value=200, value=curr_scale, step=5, key=f"scale_{region_id}_{i}")
                 
-                # 색상
                 curr_color = region.get('text_color', '#333333')
                 text_color = st.color_picker("글자색", value=curr_color, key=f"color_{region_id}_{i}")
                 
                 if st.button("💾 적용", key=f"save_{region_id}_{i}"):
-                    # 세션 및 원본 데이터 업데이트
                     st.session_state.edited_texts[region_id] = edited
                     for r in st.session_state.text_regions:
                         if r['id'] == region_id:
@@ -267,7 +268,7 @@ def render_step3_edit():
             st.rerun()
 
 def render_step4_export(settings: dict):
-    """Step 4: 내보내기 (수정된 영역만 반영)"""
+    """Step 4: 내보내기"""
     st.header("📤 Step 4: 내보내기")
     
     if not st.session_state.text_regions:
@@ -276,45 +277,34 @@ def render_step4_export(settings: dict):
     
     image = st.session_state.original_image
     regions = st.session_state.text_regions
+    target_regions = regions # 수동 모드이므로 모든 영역 대상
     
-    # 수정된 내역이 있는 것 + 수동 지정한 모든 영역을 대상으로 함
-    # (Step 2에서 수동으로 지정했다는 것 자체가 수정을 의도한 것이므로 모두 처리)
-    target_regions = regions
-    
-    if not target_regions:
-        st.info("수정할 영역이 없습니다.")
-        return
-
-    # TextRegion 객체 리스트로 변환 (Inpainter/Renderer 호환용)
+    # 텍스트 객체 변환
     target_objects = []
     for r in target_regions:
-        # 최신 수정 사항 반영 확인
         region_text = st.session_state.edited_texts.get(r['id'], r['text'])
-        
         obj = TextRegion(
             id=r['id'],
             text=region_text,
             confidence=r['confidence'],
             bounds=r['bounds'],
             is_inverted=r.get('is_inverted', False),
-            is_manual=r.get('is_manual', True),
-            suggested_font_size=r.get('suggested_font_size', 16),
+            is_manual=True,
+            suggested_font_size=r.get('suggested_font_size', 14),
             text_color=r.get('text_color', '#000000'),
             bg_color=r.get('bg_color', '#FFFFFF'),
             font_filename=r.get('font_filename', None),
-            width_scale=r.get('width_scale', 90)
+            width_scale=r.get('width_scale', 80)
         )
         target_objects.append(obj)
         
     st.success(f"✅ 총 {len(target_objects)}개의 영역을 변환합니다.")
     
     try:
-        # 1. 배경 지우기
         from modules import create_inpainter
         inpainter = create_inpainter("simple_fill")
         background = inpainter.remove_all_text_regions(image, target_objects)
         
-        # 2. 텍스트 쓰기
         renderer = CompositeRenderer()
         final_image = renderer.composite(
             background,
@@ -324,7 +314,6 @@ def render_step4_export(settings: dict):
         
         st.image(cv2.cvtColor(final_image, cv2.COLOR_BGR2RGB), caption="최종 결과물", use_container_width=True)
         
-        # 다운로드
         filename = f"infographic_fixed_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
         is_success, buffer = cv2.imencode(".png", final_image)
         
@@ -338,7 +327,6 @@ def render_step4_export(settings: dict):
             
     except Exception as e:
         st.error(f"처리 중 오류 발생: {e}")
-        st.exception(e)
 
     if st.button("⬅️ 편집 화면으로 돌아가기"):
         st.session_state.current_step = 3
@@ -346,15 +334,11 @@ def render_step4_export(settings: dict):
 
 def main():
     init_session_state()
-    
-    # 사이드바 설정
     st.sidebar.title("⚙️ 설정")
     settings = {
         'font_family': st.sidebar.selectbox("기본 폰트", ["Noto Sans KR", "NanumGothic"]),
-        'output_formats': st.sidebar.multiselect("출력 포맷", ["PNG", "JPG", "PDF"], default=["PNG"])
     }
     
-    # 단계별 라우팅
     step = st.session_state.current_step
     
     if step == 1:
