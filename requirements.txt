@@ -1,5 +1,5 @@
 # Korean Infographic Fixer - Requirements
-# Phase 1: MVP
+# Streamlit Cloud Compatible Version
 
 # Web Framework
 streamlit>=1.28.0
@@ -15,19 +15,14 @@ pytesseract>=0.3.10
 # Data Processing
 scikit-learn>=1.3.0
 
-# File Export
-psd-tools>=1.9.0
+# PDF Export
 reportlab>=4.0.0
 
-# Figma API
+# API
 requests>=2.31.0
 
 # Environment
 python-dotenv>=1.0.0
-
-# UI Components
-streamlit-drawable-canvas>=0.9.3
-streamlit-image-coordinates>=0.1.6
 
 # Utilities
 pandas>=2.0.0
