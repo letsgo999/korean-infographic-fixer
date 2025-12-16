@@ -1,6 +1,6 @@
 """
 OCR Engine Module
-텍스트 추출, 좌표 인식 및 [행간 겹침 방지]가 적용된 핵심 모듈
+텍스트 추출, 좌표 인식 및 [강력한 겹침 방지]가 적용된 모듈
 """
 import cv2
 import numpy as np
@@ -19,7 +19,6 @@ class TextRegion:
     is_inverted: bool = False
     style_tag: str = "body"
     
-    # 기본값 설정
     suggested_font_size: int = 14  
     text_color: str = "#000000"
     bg_color: str = "#FFFFFF"
@@ -153,10 +152,10 @@ def merge_regions_by_row(regions: List[TextRegion]) -> List[TextRegion]:
         merged_rows.append(new_region)
     return merged_rows
 
-def prevent_vertical_overlaps(regions: List[TextRegion], buffer: int = 2) -> List[TextRegion]:
+def prevent_vertical_overlaps(regions: List[TextRegion], buffer: int = 5) -> List[TextRegion]:
     """
-    [핵심 기능] 박스들이 수직으로 겹치지 않도록 강제 조정합니다.
-    윗 박스의 바닥이 아랫 박스의 천장을 침범하면, 윗 박스 높이를 줄입니다.
+    [강력한 겹침 방지] 이중 루프 + 수평 교차 검사
+    모든 박스 쌍을 전수 조사하여, 가로로 겹치는 박스들 사이의 세로 침범을 원천 차단합니다.
     """
     if not regions:
         return []
@@ -164,25 +163,41 @@ def prevent_vertical_overlaps(regions: List[TextRegion], buffer: int = 2) -> Lis
     # Y 좌표 순으로 정렬 (위 -> 아래)
     regions.sort(key=lambda r: r.bounds['y'])
     
-    for i in range(len(regions) - 1):
-        current = regions[i]
-        next_reg = regions[i+1]
-        
-        # 현재 박스의 바닥 좌표
-        curr_bottom = current.bounds['y'] + current.bounds['height']
-        # 다음 박스의 천장 좌표
-        next_top = next_reg.bounds['y']
-        
-        # 겹침 발생 확인 (바닥이 천장보다 아래에 있거나, 너무 딱 붙어있는 경우)
-        if curr_bottom >= next_top:
-            # 겹치지 않게 할 새로운 높이 계산 (다음 박스 천장보다 buffer만큼 위)
-            new_height = (next_top - buffer) - current.bounds['y']
+    # 이중 루프: i는 윗박스, j는 아랫박스 후보
+    for i in range(len(regions)):
+        for j in range(i + 1, len(regions)):
+            upper = regions[i]
+            lower = regions[j]
             
-            # 높이가 너무 작아지면(오류 방지) 최소값 10 유지, 아니면 적용
-            if new_height > 10:
-                current.bounds['height'] = int(new_height)
+            # 1. 아랫박스가 윗박스보다 훨씬 밑에 있어서 겹칠 가능성이 0이면 패스
+            # (최적화를 위해 추가: 윗박스 바닥 + 10px보다 아랫박스 천장이 더 아래면 검사 불필요)
+            if lower.bounds['y'] > (upper.bounds['y'] + upper.bounds['height'] + 10):
+                continue
+
+            # 2. [핵심] 수평(X축) 겹침 확인
+            # 서로 다른 컬럼에 있는 박스라면 세로로 겹쳐도 상관없음 (예: 좌측 텍스트, 우측 텍스트)
+            u_left, u_right = upper.bounds['x'], upper.bounds['x'] + upper.bounds['width']
+            l_left, l_right = lower.bounds['x'], lower.bounds['x'] + lower.bounds['width']
+            
+            # 교차 구간 계산
+            intersect_x1 = max(u_left, l_left)
+            intersect_x2 = min(u_right, l_right)
+            
+            # 교차 폭이 존재하면 (= 같은 세로 라인 상에 있다면)
+            if intersect_x2 > intersect_x1:
+                # 3. 수직 겹침 확인 및 자르기
+                u_bottom = upper.bounds['y'] + upper.bounds['height']
+                l_top = lower.bounds['y']
                 
-    # ID 재할당 및 반환
+                # 윗박스 바닥이 아랫박스 천장보다 아래거나, 여유공간(buffer) 안쪽으로 들어왔다면
+                if u_bottom >= (l_top - buffer):
+                    # 윗박스 높이 강제 조절
+                    new_height = (l_top - buffer) - upper.bounds['y']
+                    
+                    # 높이가 너무 작아져서(15px 미만) 아예 사라지는 것 방지
+                    upper.bounds['height'] = max(15, int(new_height))
+                    
+    # ID 재할당
     for i, r in enumerate(regions):
         prefix = "inv" if r.is_inverted else "ocr"
         r.id = f"{prefix}_{i:03d}"
@@ -203,7 +218,7 @@ def run_enhanced_ocr(image: np.ndarray) -> Dict:
     # 1. 행 단위로 합치기
     merged_regions = merge_regions_by_row(all_raw_regions)
     
-    # 2. [NEW] 수직 겹침 강제 해결 (Self-Check Logic)
+    # 2. [강력한] 수직 겹침 해결
     final_regions = prevent_vertical_overlaps(merged_regions)
     
     final_normal = [r for r in final_regions if not r.is_inverted]
