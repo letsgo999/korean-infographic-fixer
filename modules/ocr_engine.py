@@ -1,6 +1,6 @@
 """
 OCR Engine Module
-텍스트 추출 및 좌표 인식 (Pixel-based Projection Split)
+[Final] Edge-based Detection (색상 무관 경계선 인식) 적용
 """
 import cv2
 import numpy as np
@@ -128,7 +128,6 @@ def is_valid_text(text: str) -> bool:
     return True
 
 def merge_regions_by_row(regions: List[TextRegion]) -> List[TextRegion]:
-    # 1차 그룹핑: Y좌표가 비슷하면 무조건 한 줄로 합침 (사용자가 만족했던 그 로직)
     if not regions: return []
     regions.sort(key=lambda r: r.bounds['y'])
     merged_rows = []
@@ -153,85 +152,144 @@ def merge_regions_by_row(regions: List[TextRegion]) -> List[TextRegion]:
         merged_rows.append(new_region)
     return merged_rows
 
+def get_content_mask(image: np.ndarray) -> np.ndarray:
+    """
+    [핵심 기술] 색상 무관, 경계선(Edge) 기반 콘텐츠 감지 마스크 생성
+    글자 색깔이 무엇이든 '배경과 다르다면' 윤곽선을 잡아냅니다.
+    """
+    # 1. 그레이스케일 변환
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image
+        
+    # 2. 모폴로지 그라디언트 (경계선 추출)
+    # 팽창(Dilation) - 침식(Erosion) = 경계선
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    gradient = cv2.morphologyEx(gray, cv2.MORPH_GRADIENT, kernel)
+    
+    # 3. Otsu 이진화 (자동으로 임계값 설정하여 경계선만 흰색으로)
+    _, binary = cv2.threshold(gradient, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    
+    # 4. 노이즈 제거 (아주 작은 점들은 무시)
+    kernel_clean = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_clean)
+    
+    return binary
+
 def refine_vertical_boundaries_by_projection(image: np.ndarray, regions: List[TextRegion]) -> List[TextRegion]:
-    """
-    [핵심 알고리즘] 픽셀 투영(Projection)을 이용한 정밀 절단
-    두 박스가 겹치거나 붙어있으면, 그 사이에서 '픽셀이 가장 적은 라인(Gap)'을 찾아 자릅니다.
-    """
+    """[Updated] 경계선 기반 투영으로 세로 영역 정밀 절단"""
     if not regions: return []
     
-    # 1. 이미지 이진화 (글자는 1, 배경은 0)
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
-    # 글자가 어두운 경우와 밝은 경우 모두 대비를 극대화
-    binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 15, 10)
+    # [변경] 색상 무관 마스크 사용
+    binary = get_content_mask(image)
     
-    # Y좌표 순 정렬
     regions.sort(key=lambda r: r.bounds['y'])
     
-    # 개별 박스 최적화 (위아래 빈 공간 트리밍)
+    # 1. 개별 박스 최적화 (위아래 여백 제거)
     for r in regions:
         x, y, w, h = r.bounds['x'], r.bounds['y'], r.bounds['width'], r.bounds['height']
-        roi = binary[max(0, y):min(binary.shape[0], y+h), max(0, x):min(binary.shape[1], x+w)]
+        # 이미지 범위 체크
+        x = max(0, x); y = max(0, y)
+        w = min(w, binary.shape[1] - x); h = min(h, binary.shape[0] - y)
+        
+        roi = binary[y:y+h, x:x+w]
         if roi.size == 0: continue
         
-        # 행별 픽셀 합계
         row_sums = np.sum(roi, axis=1)
-        non_empty_rows = np.where(row_sums > (w * 255 * 0.02))[0] # 2% 이상 픽셀이 있는 곳만 인정
+        # 픽셀이 조금이라도 있는 행 찾기
+        non_empty_rows = np.where(row_sums > 0)[0]
         
         if len(non_empty_rows) > 0:
             top_trim = non_empty_rows[0]
             bottom_trim = non_empty_rows[-1]
-            # 좌표 갱신 (빈 공간 제거)
-            r.bounds['y'] = y + top_trim
-            r.bounds['height'] = bottom_trim - top_trim + 1
             
-    # [중요] 박스 간 충돌 해결 (Split Line 찾기)
+            # 최소 높이 10px 보장 (너무 납작해지는 것 방지)
+            new_h = bottom_trim - top_trim + 1
+            if new_h > 10:
+                r.bounds['y'] = y + top_trim
+                r.bounds['height'] = new_h
+
+    # 2. 박스 간 충돌 해결 (Split Line)
     for i in range(len(regions) - 1):
         upper = regions[i]
         lower = regions[i+1]
         
-        # 수직으로 겹치거나 너무 가까운 경우 (5px 이내)
         u_bottom = upper.bounds['y'] + upper.bounds['height']
         l_top = lower.bounds['y']
         
         if u_bottom >= l_top - 5:
-            # 두 박스 사이의 탐색 범위 설정 (윗박스 중간 ~ 아랫박스 중간)
             search_y_start = upper.bounds['y'] + upper.bounds['height'] // 2
             search_y_end = lower.bounds['y'] + lower.bounds['height'] // 2
             
-            # X축 공통 범위 (겹치는 가로 구간)
+            # 순서가 꼬여서 start가 end보다 크면 스킵
+            if search_y_start >= search_y_end: continue
+            
             x_start = max(upper.bounds['x'], lower.bounds['x'])
             x_end = min(upper.bounds['x'] + upper.bounds['width'], lower.bounds['x'] + lower.bounds['width'])
             
-            # 가로로 겹치지 않으면 패스
             if x_end <= x_start: continue
             
-            # 탐색 범위 내에서 픽셀 투영
+            # 탐색
             search_roi = binary[search_y_start:search_y_end, x_start:x_end]
             if search_roi.size == 0: continue
             
             row_sums = np.sum(search_roi, axis=1)
-            
-            # 픽셀 합이 가장 작은(최소값) 행 찾기 -> 여기가 빈 공간(Gap)임!
+            # 픽셀 합이 가장 작은(경계선이 없는) 곳 찾기
             min_indices = np.where(row_sums == row_sums.min())[0]
-            split_line_local = min_indices[len(min_indices)//2] # 여러 개면 중간값 선택
-            
+            split_line_local = min_indices[len(min_indices)//2]
             split_line_global = search_y_start + split_line_local
             
-            # 강제 분할 적용
-            # 윗 박스는 분할선 위에서 끝남
             upper.bounds['height'] = max(10, split_line_global - upper.bounds['y'] - 2)
-            
-            # 아랫 박스는 분할선 아래서 시작
             old_bottom = lower.bounds['y'] + lower.bounds['height']
             lower.bounds['y'] = split_line_global + 2
             lower.bounds['height'] = max(10, old_bottom - lower.bounds['y'])
 
-    # ID 재할당
     for i, r in enumerate(regions):
         prefix = "inv" if r.is_inverted else "ocr"
         r.id = f"{prefix}_{i:03d}"
+    return regions
+
+def expand_horizontal_bounds(image: np.ndarray, regions: List[TextRegion], max_lookahead: int = 200, gap_threshold: int = 30) -> List[TextRegion]:
+    """[Updated] 경계선 기반 가로 영역 확장"""
+    if not regions: return []
+    
+    # [변경] 색상 무관 마스크 사용
+    binary = get_content_mask(image)
+    img_h, img_w = binary.shape
+    
+    for r in regions:
+        if r.is_inverted: continue
+        x, y, w, h = r.bounds['x'], r.bounds['y'], r.bounds['width'], r.bounds['height']
         
+        current_x = x + w
+        consecutive_gap = 0
+        extended_pixels = 0
+        
+        while current_x < img_w and extended_pixels < max_lookahead:
+            # 안전한 ROI 슬라이싱
+            y_start = max(0, y)
+            y_end = min(img_h, y+h)
+            if y_start >= y_end: break
+
+            col_roi = binary[y_start:y_end, current_x:current_x+1]
+            
+            # 경계선(글자)이 있는가?
+            if cv2.countNonZero(col_roi) > 0:
+                consecutive_gap = 0
+            else:
+                consecutive_gap += 1
+            
+            if consecutive_gap > gap_threshold:
+                break
+                
+            current_x += 1
+            extended_pixels += 1
+            
+        final_extension = extended_pixels - consecutive_gap
+        if final_extension > 0:
+            r.bounds['width'] += final_extension
+            
     return regions
 
 def run_enhanced_ocr(image: np.ndarray) -> Dict:
@@ -244,12 +302,9 @@ def run_enhanced_ocr(image: np.ndarray) -> Dict:
         inverted_regions.extend(inv_texts)
     
     all_raw_regions = normal_regions + inverted_regions
-    
-    # 1. 9줄로 합치기
     merged_regions = merge_regions_by_row(all_raw_regions)
-    
-    # 2. [NEW] 픽셀 투영 분석으로 정밀 절단 (겹침 원천 봉쇄)
-    final_regions = refine_vertical_boundaries_by_projection(image, merged_regions)
+    vertical_refined = refine_vertical_boundaries_by_projection(image, merged_regions)
+    final_regions = expand_horizontal_bounds(image, vertical_refined)
     
     final_normal = [r for r in final_regions if not r.is_inverted]
     final_inverted = [r for r in final_regions if r.is_inverted]
