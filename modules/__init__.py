@@ -2,12 +2,13 @@
 Korean Infographic Fixer Modules Package
 """
 
-# OCR 관련 (create_manual_region 추가됨)
+# OCR 및 텍스트 영역 관련 (extract_text_from_crop 추가됨)
 from .ocr_engine import (
     TextRegion,
     run_enhanced_ocr,
     group_regions_by_lines,
-    create_manual_region
+    create_manual_region,
+    extract_text_from_crop  # [NEW] 여기가 핵심입니다!
 )
 
 # 스타일 및 색상 관련
