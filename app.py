@@ -309,7 +309,7 @@ def render_step2_detect():
             st.rerun()
 
 def render_step3_edit():
-    """Step 3: 텍스트 편집"""
+    """Step 3: 텍스트 편집 (Duplicate Key 에러 수정 버전)"""
     st.header("✏️ Step 3: 텍스트 편집")
     
     if not st.session_state.text_regions:
@@ -343,23 +343,22 @@ def render_step3_edit():
             filtered = regions
         
         # 영역별 편집 폼
+        # enumerate(filtered)의 인덱스 i를 key에 추가하여 중복 방지
         for i, region in enumerate(filtered):
             region_id = region['id']
             
-            with st.expander(
-                f"📝 {region_id}: {region['text'][:30]}..." if len(region['text']) > 30 
-                else f"📝 {region_id}: {region['text']}",
-                expanded=False
-            ):
-                # 원본 텍스트
-                st.caption(f"원본: {region['text']}")
-                st.caption(f"신뢰도: {region['confidence']}% | 스타일: {region.get('style_tag', 'body')}")
+            # Expander 제목 설정
+            display_text = region['text'][:30] + "..." if len(region['text']) > 30 else region['text']
+            
+            with st.expander(f"📝 {i+1}. {display_text}", expanded=False):
+                # 원본 텍스트 및 정보
+                st.caption(f"ID: {region_id} | 신뢰도: {region['confidence']}%")
                 
-                # 수정 텍스트 입력
+                # 수정 텍스트 입력 (Key에 _i 추가)
                 edited = st.text_area(
                     "수정된 텍스트",
                     value=st.session_state.edited_texts.get(region_id, region['text']),
-                    key=f"text_{region_id}",
+                    key=f"text_{region_id}_{i}", 
                     height=80
                 )
                 
@@ -370,18 +369,18 @@ def render_step3_edit():
                         "폰트 크기",
                         min_value=8,
                         max_value=72,
-                        value=region.get('suggested_font_size', 16),
-                        key=f"size_{region_id}"
+                        value=int(region.get('suggested_font_size', 16)),
+                        key=f"size_{region_id}_{i}"
                     )
                 with col_b:
                     text_color = st.color_picker(
                         "글자색",
                         value=region.get('text_color', '#333333'),
-                        key=f"color_{region_id}"
+                        key=f"color_{region_id}_{i}"
                     )
                 
-                # 저장 버튼
-                if st.button("💾 저장", key=f"save_{region_id}"):
+                # 저장 버튼 (Key에 _i 추가)
+                if st.button("💾 저장", key=f"save_{region_id}_{i}"):
                     st.session_state.edited_texts[region_id] = edited
                     # 영역 정보도 업데이트
                     for r in st.session_state.text_regions:
