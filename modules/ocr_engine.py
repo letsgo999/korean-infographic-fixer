@@ -1,9 +1,9 @@
 """
 OCR Engine Module
-[Final Polish] 
+[Final Innovation] 
 1. 엣지 기반 감지
 2. 픽셀 투영 행 분리
-3. [NEW] 터널 주행 기법(Tunnel Collision)으로 그림 영역 침범 원천 차단
+3. [NEW] 컨투어(객체) 분석 기반 지능형 확장 (글자 vs 그림 형태학적 구분)
 """
 import cv2
 import numpy as np
@@ -156,31 +156,41 @@ def merge_regions_by_row(regions: List[TextRegion]) -> List[TextRegion]:
     return merged_rows
 
 def get_content_mask(image: np.ndarray) -> np.ndarray:
+    # 엣지 검출 (Canny 사용) - 색상 무관하게 형태만 봅니다.
     if len(image.shape) == 3: gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     else: gray = image
+    
+    # 가우시안 블러로 노이즈 제거
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    
+    # Canny Edge Detection (경계선 검출)
+    edges = cv2.Canny(blurred, 50, 150)
+    
+    # 경계선을 약간 팽창시켜서 연결성을 좋게 함
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    gradient = cv2.morphologyEx(gray, cv2.MORPH_GRADIENT, kernel)
-    _, binary = cv2.threshold(gradient, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-    kernel_clean = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_clean)
-    return binary
+    dilated = cv2.dilate(edges, kernel, iterations=1)
+    
+    return dilated
 
 def refine_vertical_boundaries_by_projection(image: np.ndarray, regions: List[TextRegion]) -> List[TextRegion]:
+    # (이전의 성공적인 행 분리 로직 유지)
     if not regions: return []
-    binary = get_content_mask(image)
+    binary = get_content_mask(image) # Canny Edge 기반 마스크 사용
     regions.sort(key=lambda r: r.bounds['y'])
+    
+    # 개별 박스 트리밍
     for r in regions:
         x, y, w, h = r.bounds['x'], r.bounds['y'], r.bounds['width'], r.bounds['height']
-        x = max(0, x); y = max(0, y); w = min(w, binary.shape[1] - x); h = min(h, binary.shape[0] - y)
-        roi = binary[y:y+h, x:x+w]
+        roi = binary[max(0, y):min(binary.shape[0], y+h), max(0, x):min(binary.shape[1], x+w)]
         if roi.size == 0: continue
         row_sums = np.sum(roi, axis=1)
         non_empty_rows = np.where(row_sums > 0)[0]
         if len(non_empty_rows) > 0:
             top_trim = non_empty_rows[0]; bottom_trim = non_empty_rows[-1]
             new_h = bottom_trim - top_trim + 1
-            if new_h > 10:
-                r.bounds['y'] = y + top_trim; r.bounds['height'] = new_h
+            if new_h > 10: r.bounds['y'] = y + top_trim; r.bounds['height'] = new_h
+            
+    # 행간 분리
     for i in range(len(regions) - 1):
         upper = regions[i]; lower = regions[i+1]
         u_bottom = upper.bounds['y'] + upper.bounds['height']; l_top = lower.bounds['y']
@@ -200,81 +210,106 @@ def refine_vertical_boundaries_by_projection(image: np.ndarray, regions: List[Te
             old_bottom = lower.bounds['y'] + lower.bounds['height']
             lower.bounds['y'] = split_line_global + 2
             lower.bounds['height'] = max(10, old_bottom - lower.bounds['y'])
+            
     for i, r in enumerate(regions):
         prefix = "inv" if r.is_inverted else "ocr"
         r.id = f"{prefix}_{i:03d}"
     return regions
 
-def expand_horizontal_bounds(image: np.ndarray, regions: List[TextRegion], max_lookahead: int = 200, gap_threshold: int = 30) -> List[TextRegion]:
+def expand_horizontal_bounds(image: np.ndarray, regions: List[TextRegion], max_lookahead: int = 400) -> List[TextRegion]:
     """
-    [NEW] 터널 주행 (Tunnel Collision) 방식 적용
-    내 높이(Height)만큼의 터널을 뚫고 전진하되,
-    터널 위아래로 튀어나온 '큰 물체(그림)'가 감지되면 즉시 정지합니다.
+    [NEW] 컨투어(객체) 기반 지능형 확장
+    단순 픽셀 확인이 아니라, '오른쪽에 있는 덩어리'를 찾아서
+    그것이 '글자처럼 생겼으면' 먹고, '그림처럼 생겼으면' 뱉습니다.
     """
     if not regions: return []
     
-    # 엣지 마스크 생성
+    # 1. 엣지 마스크 (내용물 확인용)
     binary = get_content_mask(image)
     img_h, img_w = binary.shape
     
     for r in regions:
         if r.is_inverted: continue
         
-        x, y, w, h = r.bounds['x'], r.bounds['y'], r.bounds['width'], r.bounds['height']
+        # 현재 텍스트 라인의 기준 높이 (이것과 비슷해야 글자임)
+        ref_h = r.bounds['height']
         
-        # 1. 터널 설정 (위아래로 약간의 여유를 둠, 너무 빡빡하면 노이즈에 걸림)
-        # 텍스트 라인의 위쪽 경계와 아래쪽 경계
-        tunnel_top = max(0, y)
-        tunnel_bottom = min(img_h, y + h)
+        # 어디서부터 찾을까? (현재 박스 오른쪽 끝)
+        start_x = r.bounds['x'] + r.bounds['width']
         
-        current_x = x + w
-        consecutive_gap = 0
-        extended_pixels = 0
+        # 탐색 영역 (오른쪽으로 max_lookahead 만큼, 위아래로 약간 여유)
+        # 텍스트 라인의 Y축 범위 (위아래 10% 여유)
+        y_margin = int(ref_h * 0.2)
+        roi_y1 = max(0, r.bounds['y'] - y_margin)
+        roi_y2 = min(img_h, r.bounds['y'] + r.bounds['height'] + y_margin)
+        roi_x1 = start_x
+        roi_x2 = min(img_w, start_x + max_lookahead)
         
-        while current_x < img_w and extended_pixels < max_lookahead:
-            # 2. 터널 내부 검사 (In-Tunnel)
-            # 현재 x위치의 터널 내부 픽셀들을 봅니다.
-            col_roi_inner = binary[tunnel_top:tunnel_bottom, current_x:current_x+1]
-            has_content_inside = cv2.countNonZero(col_roi_inner) > 0
+        if roi_x2 <= roi_x1: continue
+        
+        # ROI 추출
+        roi = binary[roi_y1:roi_y2, roi_x1:roi_x2]
+        
+        # 2. 덩어리(Contours) 찾기
+        contours, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # 발견된 덩어리들을 왼쪽부터 순서대로 정렬
+        blob_list = []
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            # 너무 작은 노이즈(점)는 무시
+            if w < 3 or h < 3: continue 
+            blob_list.append((x, y, w, h))
             
-            # 3. 충돌 감지 (Out-of-Tunnel Check) - 여기가 핵심!
-            # 터널 바로 위(Head)와 바로 아래(Feet)를 검사합니다.
-            # 만약 터널 내부에도 픽셀이 있고, 외부(위/아래)에도 픽셀이 연결되어 있다면? -> 큰 그림이다!
+        # X좌표 기준 정렬
+        blob_list.sort(key=lambda b: b[0])
+        
+        current_extension = 0
+        
+        # 3. 덩어리 심사 (글자니? 그림이니?)
+        for bx, by, bw, bh in blob_list:
+            # 덩어리의 절대 좌표 변환
+            abs_x = roi_x1 + bx
             
-            # 위쪽 감시 구역 (터널 위 10px)
-            check_top = max(0, tunnel_top - 10)
-            col_roi_upper = binary[check_top:tunnel_top, current_x:current_x+1]
+            # --- 심사 기준 1: 거리 ---
+            # 이전 글자와 너무 멀리 떨어져 있으면(100px 이상) 남남임
+            gap = abs_x - (r.bounds['x'] + r.bounds['width'] + current_extension)
+            if gap > 100: 
+                break # 여기서 끝
             
-            # 아래쪽 감시 구역 (터널 아래 10px)
-            check_bottom = min(img_h, tunnel_bottom + 10)
-            col_roi_lower = binary[tunnel_bottom:check_bottom, current_x:current_x+1]
-            
-            has_content_upper = cv2.countNonZero(col_roi_upper) > 0
-            has_content_lower = cv2.countNonZero(col_roi_lower) > 0
-            
-            # [STOP 조건] 
-            # 내용물이 있는데(has_content_inside), 그게 위나 아래로 삐져나와 있다면(upper/lower)
-            # 이것은 텍스트 라인이 아니라 세로로 긴 물체(사람, 아이콘 등)입니다.
-            if has_content_inside and (has_content_upper or has_content_lower):
-                # 단, 아주 미세한 연결(1~2픽셀)은 노이즈일 수 있으니 무시할 수도 있지만,
-                # 안전을 위해 여기서는 발견 즉시 멈춥니다.
-                break
-            
-            # 일반적인 확장 로직
-            if has_content_inside:
-                consecutive_gap = 0
-            else:
-                consecutive_gap += 1
-            
-            if consecutive_gap > gap_threshold:
-                break
+            # --- 심사 기준 2: 높이 유사성 (가장 중요) ---
+            # 글자라면 기존 줄 높이의 50% ~ 150% 사이여야 함
+            # 그림(일러스트)은 보통 훨씬 큼
+            if bh > (ref_h * 1.5):
+                break # 너무 큰 놈이 나타났다 -> 그림이다 -> 정지!
                 
-            current_x += 1
-            extended_pixels += 1
+            # --- 심사 기준 3: 수직 정렬 ---
+            # 글자라면 기존 줄의 Y 범위 안에 들어와야 함
+            # 덩어리의 중심이 텍스트 라인의 중심과 비슷해야 함
+            blob_center_y = roi_y1 + by + bh/2
+            line_center_y = r.bounds['y'] + r.bounds['height']/2
             
-        final_extension = extended_pixels - consecutive_gap
-        if final_extension > 0:
-            r.bounds['width'] += final_extension
+            if abs(blob_center_y - line_center_y) > (ref_h * 0.6):
+                # 위나 아래로 너무 튀어 나간 놈 -> 그림의 일부일 가능성 큼
+                break
+            
+            # --- 심사 기준 4: 형태 (비율) ---
+            # 아이콘(페이스북 등)은 보통 정사각형에 가깝고 꽉 차 있음
+            # 하지만 "글자"도 'ㅁ' 같은 건 그럴 수 있음.
+            # 여기서는 "크기"와 "위치"가 맞으면 일단 글자로 간주하되,
+            # 너무 넓은 덩어리(가로로 긴 박스)는 제외
+            if bw > (ref_h * 3.0): # 높이보다 3배 이상 긴 덩어리?
+                break # 그림 배경이나 배너일 확률 높음 -> 정지
+            
+            # 합격! 이 덩어리는 글자(파편)다. 포함시킨다.
+            # 박스 확장
+            new_right_edge = abs_x + bw
+            current_w = new_right_edge - r.bounds['x']
+            
+            # 기존 너비보다 커지면 업데이트
+            if current_w > r.bounds['width']:
+                r.bounds['width'] = current_w
+                current_extension = current_w - (start_x - r.bounds['x']) # 갱신
             
     return regions
 
@@ -290,7 +325,7 @@ def run_enhanced_ocr(image: np.ndarray) -> Dict:
     all_raw_regions = normal_regions + inverted_regions
     merged_regions = merge_regions_by_row(all_raw_regions)
     vertical_refined = refine_vertical_boundaries_by_projection(image, merged_regions)
-    # [NEW] 터널 충돌 방지 적용
+    # [NEW] 컨투어 기반 지능형 확장
     final_regions = expand_horizontal_bounds(image, vertical_refined)
     
     final_normal = [r for r in final_regions if not r.is_inverted]
