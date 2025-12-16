@@ -2,17 +2,18 @@
 Korean Infographic Fixer Modules Package
 """
 
-# OCR 관련
+# OCR 관련 (create_manual_region 추가됨)
 from .ocr_engine import (
     TextRegion,
     run_enhanced_ocr,
-    group_regions_by_lines
+    group_regions_by_lines,
+    create_manual_region
 )
 
 # 스타일 및 색상 관련
 from .style_classifier import apply_styles_and_colors
 
-# 이미지 복원 (인페인팅) 관련 - 여기가 에러 원인이었습니다
+# 이미지 복원 (인페인팅) 관련
 from .inpainter import (
     create_inpainter,
     Inpainter
@@ -24,4 +25,3 @@ from .text_renderer import CompositeRenderer
 # 내보내기 및 메타데이터 관련
 from .exporter import MultiFormatExporter
 from .metadata_builder import MetadataBuilder
-from .text_renderer import CompositeRenderer
