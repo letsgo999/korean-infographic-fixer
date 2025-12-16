@@ -1,72 +1,27 @@
 """
-Korean Infographic Fixer - Modules
+Korean Infographic Fixer Modules Package
 """
+
+# OCR 관련
 from .ocr_engine import (
     TextRegion,
-    OCREngine,
-    InvertedRegionDetector,
-    group_regions_by_lines,
-    run_enhanced_ocr
+    run_enhanced_ocr,
+    group_regions_by_lines
 )
 
-from .style_classifier import (
-    StyleClassifier,
-    ColorExtractor,
-    apply_styles_and_colors
-)
+# 스타일 및 색상 관련
+from .style_classifier import apply_styles_and_colors
 
+# 이미지 복원 (인페인팅) 관련 - 여기가 에러 원인이었습니다
 from .inpainter import (
-    SimpleInpainter,
-    OpenCVInpainter,
-    create_inpainter
+    create_inpainter,
+    Inpainter
 )
 
-from .metadata_builder import (
-    MetadataBuilder,
-    create_manual_region,
-    merge_overlapping_regions
-)
+# 텍스트 렌더링 관련
+from .text_renderer import CompositeRenderer
 
-from .text_renderer import (
-    TextRenderer,
-    CompositeRenderer
-)
-
-from .exporter import (
-    PNGExporter,
-    PDFExporter,
-    MultiFormatExporter
-)
-
-__all__ = [
-    # OCR
-    'TextRegion',
-    'OCREngine',
-    'InvertedRegionDetector',
-    'group_regions_by_lines',
-    'run_enhanced_ocr',
-    
-    # Style
-    'StyleClassifier',
-    'ColorExtractor',
-    'apply_styles_and_colors',
-    
-    # Inpainting
-    'SimpleInpainter',
-    'OpenCVInpainter',
-    'create_inpainter',
-    
-    # Metadata
-    'MetadataBuilder',
-    'create_manual_region',
-    'merge_overlapping_regions',
-    
-    # Rendering
-    'TextRenderer',
-    'CompositeRenderer',
-    
-    # Export
-    'PNGExporter',
-    'PDFExporter',
-    'MultiFormatExporter',
-]
+# 내보내기 및 메타데이터 관련
+from .exporter import MultiFormatExporter
+from .metadata_builder import MetadataBuilder
+from .text_renderer import CompositeRenderer
