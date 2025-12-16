@@ -1,6 +1,6 @@
 """
 OCR Engine Module
-텍스트 추출 및 좌표 인식을 담당하는 핵심 모듈 (Tuned Version)
+텍스트 추출 및 좌표 인식을 담당하는 핵심 모듈 (Final Polish with NMS)
 """
 import cv2
 import numpy as np
@@ -48,6 +48,7 @@ class OCREngine:
             image_rgb = image
             
         pil_image = Image.fromarray(image_rgb)
+        # 뭉쳐서 읽기
         custom_config = r'--oem 3 --psm 6'
         
         try:
@@ -197,9 +198,7 @@ class InvertedRegionDetector:
 
 
 def smart_merge_regions(regions: List[TextRegion], x_tolerance: int = 60, y_tolerance: int = 20) -> List[TextRegion]:
-    """
-    [튜닝됨] x_tolerance를 60으로 늘려 멀리 떨어진 단어도 문장으로 합칩니다.
-    """
+    """물리적 거리가 가까운 영역 병합"""
     if not regions:
         return []
 
@@ -214,11 +213,9 @@ def smart_merge_regions(regions: List[TextRegion], x_tolerance: int = 60, y_tole
         
         y_diff = abs(curr_b['y'] - next_b['y'])
         h_diff = abs(curr_b['height'] - next_b['height'])
-        # 같은 라인 판정 (높이 차이 허용치도 조금 늘림)
         is_same_line = y_diff < y_tolerance and h_diff < (max(curr_b['height'], next_b['height']) * 0.7)
         
         x_dist = next_b['x'] - (curr_b['x'] + curr_b['width'])
-        # x_tolerance를 60으로 사용
         is_close_x = -15 < x_dist < x_tolerance
         
         is_same_type = current.is_inverted == next_reg.is_inverted
@@ -245,21 +242,73 @@ def smart_merge_regions(regions: List[TextRegion], x_tolerance: int = 60, y_tole
             current = next_reg
             
     merged.append(current)
+    return merged
+
+def remove_overlapping_regions(regions: List[TextRegion], overlap_threshold: float = 0.5) -> List[TextRegion]:
+    """
+    [핵심 추가 기능] 
+    다른 영역에 포함되거나 겹치는 '작은 영역'을 제거합니다.
+    큰 박스가 작은 박스를 삼키는 방식입니다.
+    """
+    if not regions:
+        return []
+        
+    # 면적 기준 내림차순 정렬 (큰 박스부터 처리)
+    sorted_regions = sorted(regions, key=lambda r: r.bounds['width'] * r.bounds['height'], reverse=True)
+    keep_indices = [True] * len(sorted_regions)
     
-    for i, r in enumerate(merged):
+    for i in range(len(sorted_regions)):
+        if not keep_indices[i]:
+            continue
+            
+        r1 = sorted_regions[i]
+        b1 = r1.bounds
+        area1 = b1['width'] * b1['height']
+        
+        for j in range(i + 1, len(sorted_regions)):
+            if not keep_indices[j]:
+                continue
+                
+            r2 = sorted_regions[j]
+            b2 = r2.bounds
+            area2 = b2['width'] * b2['height']
+            
+            # 교집합(겹치는 부분) 계산
+            x_left = max(b1['x'], b2['x'])
+            y_top = max(b1['y'], b2['y'])
+            x_right = min(b1['x'] + b1['width'], b2['x'] + b2['width'])
+            y_bottom = min(b1['y'] + b1['height'], b2['y'] + b2['height'])
+            
+            if x_right > x_left and y_bottom > y_top:
+                intersection_area = (x_right - x_left) * (y_bottom - y_top)
+                
+                # 작은 박스(r2)의 50% 이상이 큰 박스(r1)에 포함되면 제거
+                if intersection_area > (area2 * overlap_threshold):
+                    keep_indices[j] = False
+                    
+    # 살아남은 영역만 필터링 및 ID 재할당
+    final_regions = []
+    for i, keep in enumerate(keep_indices):
+        if keep:
+            final_regions.append(sorted_regions[i])
+            
+    # Y 좌표 순으로 다시 정렬 (사용자 편의)
+    final_regions.sort(key=lambda r: (r.bounds['y'], r.bounds['x']))
+    
+    # ID 재할당
+    for i, r in enumerate(final_regions):
         prefix = "inv" if r.is_inverted else "ocr"
         r.id = f"{prefix}_{i:03d}"
         
-    return merged
+    return final_regions
 
 
 def run_enhanced_ocr(image: np.ndarray) -> Dict:
-    """향상된 OCR 파이프라인 실행"""
+    """향상된 OCR 파이프라인 (NMS 포함)"""
     ocr_engine = OCREngine()
     inv_detector = InvertedRegionDetector()
     
     normal_regions = ocr_engine.extract_text_regions(image)
-    
     dark_regions = inv_detector.detect(image)
     inverted_regions = []
     for region_bounds in dark_regions:
@@ -268,16 +317,19 @@ def run_enhanced_ocr(image: np.ndarray) -> Dict:
     
     all_raw_regions = normal_regions + inverted_regions
     
-    # 튜닝된 스마트 병합 실행
+    # 1. 뭉치기 (Merge)
     merged_regions = smart_merge_regions(all_raw_regions)
     
-    final_normal = [r for r in merged_regions if not r.is_inverted]
-    final_inverted = [r for r in merged_regions if r.is_inverted]
+    # 2. 겹치는 것 제거 (NMS) - 여기서 중복 박스가 사라집니다!
+    final_regions = remove_overlapping_regions(merged_regions)
+    
+    final_normal = [r for r in final_regions if not r.is_inverted]
+    final_inverted = [r for r in final_regions if r.is_inverted]
     
     return {
         'normal_regions': final_normal,
         'inverted_regions': final_inverted,
-        'all_regions': merged_regions,
+        'all_regions': final_regions,
         'image_info': {
             'width': image.shape[1],
             'height': image.shape[0]
