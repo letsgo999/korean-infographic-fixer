@@ -7,6 +7,7 @@ import os
 import tempfile
 from datetime import datetime
 from pathlib import Path
+import uuid # [NEW] 강제 새로고침을 위한 키 생성용
 
 # [필수] 캔버스 라이브러리
 from streamlit_drawable_canvas import st_canvas
@@ -35,8 +36,39 @@ def init_session_state():
         st.session_state.text_regions = []
     if 'edited_texts' not in st.session_state:
         st.session_state.edited_texts = {}
-    if 'processed_image' not in st.session_state:
-        st.session_state.processed_image = None
+    if 'canvas_key' not in st.session_state:
+        st.session_state.canvas_key = "canvas_v1" # 캔버스 리셋용 키
+
+# [핵심 최적화 1] 이미지 처리 함수 캐싱 (매번 연산하지 않음)
+@st.cache_data
+def process_image_for_display(image_array, max_width=800):
+    """
+    이미지를 화면에 표시하기 좋게 리사이징하고 PIL 형식으로 변환합니다.
+    이 결과는 캐시에 저장되어 멈춤 현상을 방지합니다.
+    """
+    h_orig, w_orig = image_array.shape[:2]
+    scale_factor = 1.0
+    
+    # 리사이징 로직
+    if w_orig > max_width:
+        scale_factor = w_orig / max_width
+        new_width = max_width
+        new_height = int(h_orig / scale_factor)
+        display_img_cv = cv2.resize(image_array, (new_width, new_height), interpolation=cv2.INTER_AREA)
+    else:
+        display_img_cv = image_array
+        new_width = w_orig
+        new_height = h_orig
+        
+    # BGR -> RGB 변환
+    if len(display_img_cv.shape) == 3:
+        img_rgb = cv2.cvtColor(display_img_cv, cv2.COLOR_BGR2RGB)
+    else:
+        img_rgb = display_img_cv
+        
+    pil_image = Image.fromarray(img_rgb)
+    
+    return pil_image, scale_factor, new_width, new_height
 
 def draw_regions_on_image(image, regions, edited_texts):
     """미리보기용 이미지에 박스 그리기"""
@@ -56,13 +88,13 @@ def draw_regions_on_image(image, regions, edited_texts):
         x, y, w, h = bounds['x'], bounds['y'], bounds['width'], bounds['height']
         
         if r_id in edited_texts and edited_texts[r_id] != text:
-            color = (255, 0, 255) # 수정됨 (Magenta)
+            color = (255, 0, 255) # Magenta
             thickness = 3
         elif is_inverted:
-            color = (255, 100, 0) # 역상 (Blue-ish)
+            color = (255, 100, 0) 
             thickness = 2
         else:
-            color = (0, 255, 0)   # 일반 (Green)
+            color = (0, 255, 0)   
             thickness = 2
             
         cv2.rectangle(vis_image, (x, y), (x + w, y + h), color, thickness)
@@ -72,7 +104,6 @@ def draw_regions_on_image(image, regions, edited_texts):
 def render_step1_upload():
     """Step 1: 이미지 업로드"""
     st.header("1. 이미지 업로드")
-    
     uploaded_file = st.file_uploader("인포그래픽 이미지를 업로드하세요", type=['png', 'jpg', 'jpeg'])
     
     if uploaded_file is not None:
@@ -90,7 +121,7 @@ def render_step1_upload():
             st.rerun()
 
 def render_step2_detect():
-    """Step 2: 수동 영역 지정 (기본값 설정 적용: 16px, 90%, Black 폰트)"""
+    """Step 2: 수동 영역 지정 (캐싱 및 안정성 강화 버전)"""
     st.header("Step 2: 텍스트 영역 지정")
     
     if st.session_state.original_image is None:
@@ -98,34 +129,26 @@ def render_step2_detect():
         return
 
     original_image = st.session_state.original_image
-    h_orig, w_orig = original_image.shape[:2]
     
-    # [최적화] 이미지 리사이징 (화면 멈춤 방지)
-    MAX_WIDTH = 800
-    scale_factor = 1.0
-    
-    if w_orig > MAX_WIDTH:
-        scale_factor = w_orig / MAX_WIDTH
-        new_width = MAX_WIDTH
-        new_height = int(h_orig / (w_orig / MAX_WIDTH))
-        display_image = cv2.resize(original_image, (new_width, new_height), interpolation=cv2.INTER_AREA)
-    else:
-        display_image = original_image
-        new_width = w_orig
-        new_height = h_orig
-
+    # [최적화] 캐시된 함수로 이미지 처리 (렉 방지)
     try:
-        if len(display_image.shape) == 3:
-            img_rgb = cv2.cvtColor(display_image, cv2.COLOR_BGR2RGB)
-        else:
-            img_rgb = display_image
-        pil_image = Image.fromarray(img_rgb)
+        pil_image, scale_factor, new_width, new_height = process_image_for_display(original_image)
+        # 디버깅 정보: 이미지가 제대로 계산되었는지 확인
+        st.caption(f"ℹ️ 이미지 로드 완료: {new_width}x{new_height}px (원본 비율 {scale_factor:.2f})")
     except Exception as e:
-        st.error(f"이미지 변환 오류: {e}")
+        st.error(f"이미지 처리 중 오류 발생: {e}")
         return
 
     st.info(f"🖱️ 마우스로 수정할 텍스트 영역을 박스로 그려주세요.")
 
+    col_reset, _ = st.columns([1, 4])
+    with col_reset:
+        # [핵심] 멈췄을 때 뚫어주는 버튼
+        if st.button("🔄 캔버스 강제 새로고침"):
+            st.session_state.canvas_key = f"canvas_{uuid.uuid4()}" # 키를 변경하여 컴포넌트 재로드
+            st.rerun()
+
+    # 캔버스 호출
     try:
         canvas_result = st_canvas(
             fill_color="rgba(255, 165, 0, 0.2)",
@@ -136,11 +159,11 @@ def render_step2_detect():
             height=new_height,
             width=new_width,
             drawing_mode="rect",
-            key="canvas_optimized_v2", # 키 변경으로 캔버스 리프레시 유도
+            key=st.session_state.canvas_key, # 동적 키 사용
             display_toolbar=True
         )
     except Exception as e:
-        st.error(f"캔버스 로드 실패: {e}")
+        st.error(f"캔버스 컴포넌트 로딩 실패: {e}")
         st.stop()
 
     if canvas_result.json_data is not None:
@@ -149,43 +172,40 @@ def render_step2_detect():
         if len(objects) > 0:
             st.success(f"✅ 총 {len(objects)}개의 영역이 지정되었습니다.")
             
-            col1, col2 = st.columns([1, 1])
-            with col1:
-                if st.button("🗑️ 영역 초기화"):
-                    st.rerun()
-            
-            with col2:
-                if st.button("📝 텍스트 추출 및 편집하기", type="primary"):
-                    with st.spinner("텍스트 분석 및 기본값 적용 중..."):
-                        regions = []
-                        for i, obj in enumerate(objects):
-                            # 좌표 복원
-                            x = int(obj["left"] * scale_factor)
-                            y = int(obj["top"] * scale_factor)
-                            w = int(obj["width"] * scale_factor)
-                            h = int(obj["height"] * scale_factor)
-                            
-                            x = max(0, min(x, w_orig))
-                            y = max(0, min(y, h_orig))
-                            w = min(w, w_orig - x)
-                            h = min(h, h_orig - y)
-                            
-                            if w < 5 or h < 5: continue
-
-                            # 1. 텍스트 추출
-                            region = extract_text_from_crop(original_image, x, y, w, h)
-                            region.id = f"manual_{i:03d}"
-                            
-                            # -------------------------------------------------------
-                            # [핵심 변경] 요청하신 기본값 적용
-                            # -------------------------------------------------------
-                            region.suggested_font_size = 16                 # 기본 크기 16
-                            region.width_scale = 90                         # 기본 장평 90%
-                            region.font_filename = "NotoSansKR-Bold.ttf"   # 기본 폰트 Black
-                            # -------------------------------------------------------
-                            
-                            regions.append(region.to_dict())
+            if st.button("📝 텍스트 추출 및 편집하기 (Step 3)", type="primary"):
+                with st.spinner("텍스트 분석 및 기본값 적용 중..."):
+                    regions = []
+                    h_orig, w_orig = original_image.shape[:2]
+                    
+                    for i, obj in enumerate(objects):
+                        # 좌표 복원 계산
+                        x = int(obj["left"] * scale_factor)
+                        y = int(obj["top"] * scale_factor)
+                        w = int(obj["width"] * scale_factor)
+                        h = int(obj["height"] * scale_factor)
                         
+                        # 좌표 유효성 검사
+                        x = max(0, min(x, w_orig))
+                        y = max(0, min(y, h_orig))
+                        w = min(w, w_orig - x)
+                        h = min(h, h_orig - y)
+                        
+                        if w < 5 or h < 5: continue
+
+                        # 텍스트 추출
+                        region = extract_text_from_crop(original_image, x, y, w, h)
+                        region.id = f"manual_{i:03d}"
+                        
+                        # [요청하신 기본값 적용]
+                        region.suggested_font_size = 16
+                        region.width_scale = 90
+                        region.font_filename = "NotoSansKR-Black.ttf"
+                        
+                        regions.append(region.to_dict())
+                    
+                    if not regions:
+                        st.warning("유효한 영역이 없습니다. 다시 그려주세요.")
+                    else:
                         st.session_state.text_regions = regions
                         st.session_state.current_step = 3
                         st.rerun()
@@ -201,7 +221,6 @@ def render_step3_edit():
     image = st.session_state.original_image
     regions = st.session_state.text_regions
     
-    # 폰트 로드
     fonts_dir = os.path.join(os.path.dirname(__file__), 'fonts')
     if not os.path.exists(fonts_dir):
         os.makedirs(fonts_dir)
@@ -277,9 +296,8 @@ def render_step4_export(settings: dict):
     
     image = st.session_state.original_image
     regions = st.session_state.text_regions
-    target_regions = regions # 수동 모드이므로 모든 영역 대상
+    target_regions = regions
     
-    # 텍스트 객체 변환
     target_objects = []
     for r in target_regions:
         region_text = st.session_state.edited_texts.get(r['id'], r['text'])
