@@ -366,6 +366,6 @@ def create_manual_region(x: int, y: int, width: int, height: int, text: str, sty
         is_inverted=False,
         is_manual=True,
         style_tag=style_tag,
-        suggested_font_size=14,
-        width_scale=80
+        suggested_font_size=16,
+        width_scale=90
     )
