@@ -11,7 +11,7 @@ class CompositeRenderer:
     def __init__(self):
         # 폰트 파일 경로 설정 (fonts 폴더 안의 NanumGothic.ttf)
         # 주의: 업로드한 폰트 파일명과 정확히 일치해야 합니다!
-        self.font_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'fonts', 'NanumGothic.ttf')
+        self.font_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'fonts', 'NotoSansKR-Bold.ttf')
         
         # 폰트 파일이 없으면 경고 출력
         if not os.path.exists(self.font_path):
