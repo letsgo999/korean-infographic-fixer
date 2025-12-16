@@ -1,9 +1,8 @@
 """
 OCR Engine Module
-[v4 - 원점 재설계] 
-1. 행 병합 기본 유지 (같은 Y축 = 같은 행)
-2. 수평 확장 시 "정사각형 덩어리"를 만나면 멈춤
-3. 복잡한 컬러 분석 제거
+[v5 - 다양한 그래픽 형태 대응] 
+1. 행 병합 기본 유지
+2. 수평 확장 시 그래픽 감지 (정사각형 + 세로형 + 대형)
 """
 import cv2
 import numpy as np
@@ -242,72 +241,130 @@ def refine_vertical_boundaries_by_projection(image: np.ndarray, regions: List[Te
     return regions
 
 
+def is_graphic_blob(blob_w: int, blob_h: int, blob_y: int, blob_abs_y: int, 
+                    text_line_height: int, text_line_y: int, text_line_bottom: int) -> bool:
+    """
+    덩어리가 그래픽(아이콘/일러스트/사진)인지 판단
+    
+    그래픽의 특징:
+    1. 정사각형에 가까움 (아이콘)
+    2. 세로로 김 (일러스트, 인물사진)
+    3. 텍스트 행 높이보다 훨씬 큼
+    4. 현재 텍스트 행의 Y 범위를 벗어남 (여러 행에 걸침)
+    """
+    
+    # 기준값
+    min_graphic_size = text_line_height * 0.7  # 텍스트 높이의 70% 이상이면 고려 대상
+    
+    # 너무 작으면 텍스트 파편일 가능성
+    if blob_w < min_graphic_size and blob_h < min_graphic_size:
+        return False
+    
+    aspect_ratio = blob_w / blob_h if blob_h > 0 else 999
+    
+    # 조건 1: 정사각형에 가까운 덩어리 (0.5 ~ 2.0)
+    is_square = 0.5 <= aspect_ratio <= 2.0
+    
+    # 조건 2: 세로로 긴 덩어리 (aspect < 0.5, 즉 height > width * 2)
+    is_vertical = aspect_ratio < 0.5
+    
+    # 조건 3: 텍스트 행 높이의 1.5배 이상 큰 덩어리
+    is_tall = blob_h > text_line_height * 1.5
+    is_wide = blob_w > text_line_height * 1.5
+    is_large = is_tall or (is_square and is_wide)
+    
+    # 조건 4: 현재 텍스트 행의 Y 범위를 크게 벗어남
+    blob_top = blob_abs_y
+    blob_bottom = blob_abs_y + blob_h
+    extends_above = blob_top < text_line_y - 10
+    extends_below = blob_bottom > text_line_bottom + 10
+    spans_multiple_lines = extends_above or extends_below
+    
+    # 최종 판단: 위 조건 중 하나라도 해당되면 그래픽
+    if is_square and (is_large or blob_w > min_graphic_size):
+        return True
+    if is_vertical and blob_h > text_line_height:
+        return True
+    if is_large and spans_multiple_lines:
+        return True
+    if blob_h > text_line_height * 2:  # 텍스트 높이의 2배 이상이면 무조건 그래픽
+        return True
+    
+    return False
+
+
 def find_right_boundary(image: np.ndarray, region: TextRegion, max_lookahead: int = 500) -> int:
     """
-    [핵심 함수] 텍스트 행의 오른쪽 끝을 어디서 자를지 결정
-    
-    원리: 오른쪽으로 스캔하면서 "정사각형에 가까운 큰 덩어리"를 만나면 그 전에서 멈춤
-    - 텍스트: 가로로 길쭉함 (width >> height)
-    - 아이콘/그림: 정사각형에 가까움 (width ≈ height)
+    텍스트 행의 오른쪽 끝을 어디서 자를지 결정
+    그래픽(아이콘/일러스트/사진)을 만나면 그 전에서 멈춤
     """
     binary = get_content_mask(image)
     img_h, img_w = binary.shape
     
-    ref_h = region.bounds['height']
+    text_h = region.bounds['height']
+    text_y = region.bounds['y']
+    text_bottom = text_y + text_h
     start_x = region.bounds['x'] + region.bounds['width']
-    y1 = max(0, region.bounds['y'] - 5)
-    y2 = min(img_h, region.bounds['y'] + ref_h + 5)
     
-    # 탐색 범위
-    search_end = min(img_w, start_x + max_lookahead)
+    # 위아래 여유를 두고 탐색 (일러스트가 행 범위를 벗어날 수 있으므로)
+    search_y1 = max(0, text_y - text_h * 2)
+    search_y2 = min(img_h, text_bottom + text_h * 2)
+    search_x2 = min(img_w, start_x + max_lookahead)
     
-    if search_end <= start_x:
+    if search_x2 <= start_x:
         return region.bounds['x'] + region.bounds['width']
     
-    # 오른쪽 영역에서 컨투어 찾기
-    roi = binary[y1:y2, start_x:search_end]
+    # 넓은 영역에서 컨투어 찾기
+    roi = binary[search_y1:search_y2, start_x:search_x2]
     if roi.size == 0:
         return region.bounds['x'] + region.bounds['width']
     
     contours, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    # 덩어리들을 왼쪽부터 정렬
+    # 덩어리들 수집
     blobs = []
     for cnt in contours:
         x, y, w, h = cv2.boundingRect(cnt)
         if w < 5 or h < 5:
             continue
-        blobs.append({'x': x, 'y': y, 'w': w, 'h': h, 'abs_x': start_x + x})
+        abs_x = start_x + x
+        abs_y = search_y1 + y
+        blobs.append({
+            'x': x, 'y': y, 'w': w, 'h': h,
+            'abs_x': abs_x, 'abs_y': abs_y
+        })
     
+    # X 좌표로 정렬
     blobs.sort(key=lambda b: b['x'])
     
     current_right = region.bounds['x'] + region.bounds['width']
     
     for blob in blobs:
-        # 이전 끝과 너무 멀리 떨어져 있으면 (100px 이상 간격) 여기서 끝
-        gap = blob['abs_x'] - current_right
+        abs_x = blob['abs_x']
+        abs_y = blob['abs_y']
+        w, h = blob['w'], blob['h']
+        
+        # 이전 끝과 너무 멀리 떨어져 있으면 확장 중단
+        gap = abs_x - current_right
         if gap > 100:
             break
         
-        w, h = blob['w'], blob['h']
-        
-        # [핵심 판단] 정사각형에 가까운 큰 덩어리 = 아이콘/그림
-        aspect_ratio = w / h if h > 0 else 0
-        is_square_ish = 0.5 <= aspect_ratio <= 2.0  # 정사각형에 가까움
-        is_big = w > ref_h * 0.8 and h > ref_h * 0.8  # 텍스트 높이보다 큰 덩어리
-        
-        if is_square_ish and is_big:
-            # 아이콘/그림으로 판단 → 여기서 멈춤
+        # 그래픽인지 판단
+        if is_graphic_blob(w, h, blob['y'], abs_y, text_h, text_y, text_bottom):
+            # 그래픽을 만남 → 여기서 멈춤
             break
         
-        # 텍스트로 판단 → 포함
-        current_right = blob['abs_x'] + w
+        # 텍스트로 판단 → 이 영역까지 포함
+        # 단, 현재 텍스트 행의 Y 범위 안에 있는 것만
+        blob_cy = abs_y + h // 2
+        if text_y - 10 <= blob_cy <= text_bottom + 10:
+            current_right = abs_x + w
     
     return current_right
 
 
 def expand_horizontal_bounds(image: np.ndarray, regions: List[TextRegion]) -> List[TextRegion]:
-    """행 단위로 오른쪽 경계 확장 (아이콘/그림 전에서 멈춤)"""
+    """행 단위로 오른쪽 경계 확장 (그래픽 전에서 멈춤)"""
     if not regions:
         return []
     
@@ -315,7 +372,6 @@ def expand_horizontal_bounds(image: np.ndarray, regions: List[TextRegion]) -> Li
         if r.is_inverted:
             continue
         
-        # 오른쪽 경계 찾기
         right_x = find_right_boundary(image, r)
         new_width = right_x - r.bounds['x']
         
@@ -330,24 +386,17 @@ def run_enhanced_ocr(image: np.ndarray) -> Dict:
     ocr_engine = OCREngine()
     inv_detector = InvertedRegionDetector()
     
-    # 1. OCR로 텍스트 추출
     normal_regions = ocr_engine.extract_text_regions(image)
     
-    # 2. 역상 영역 처리
     dark_regions = inv_detector.detect(image)
     inverted_regions = []
     for region_bounds in dark_regions:
         inv_texts = ocr_engine.extract_from_inverted_region(image, region_bounds)
         inverted_regions.extend(inv_texts)
     
-    # 3. 행 단위 병합 (핵심 - 같은 Y축은 하나의 행)
     all_raw_regions = normal_regions + inverted_regions
     merged_regions = merge_regions_by_row(all_raw_regions)
-    
-    # 4. 수직 경계 정제 (행간 분리)
     vertical_refined = refine_vertical_boundaries_by_projection(image, merged_regions)
-    
-    # 5. 수평 확장 (아이콘/그림 전에서 멈춤)
     final_regions = expand_horizontal_bounds(image, vertical_refined)
     
     final_normal = [r for r in final_regions if not r.is_inverted]
