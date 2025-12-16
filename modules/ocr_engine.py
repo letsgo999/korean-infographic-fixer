@@ -1,8 +1,9 @@
 """
 OCR Engine Module
-[v5 - 다양한 그래픽 형태 대응] 
-1. 행 병합 기본 유지
-2. 수평 확장 시 그래픽 감지 (정사각형 + 세로형 + 대형)
+[v6 - 공백 기반 끊기] 
+1. 행 병합 유지
+2. 수평 확장 시 "두 글자 이상 공백"이 나오면 거기서 끊음
+3. 복잡한 형태/색상 분석 완전 제거
 """
 import cv2
 import numpy as np
@@ -241,130 +242,69 @@ def refine_vertical_boundaries_by_projection(image: np.ndarray, regions: List[Te
     return regions
 
 
-def is_graphic_blob(blob_w: int, blob_h: int, blob_y: int, blob_abs_y: int, 
-                    text_line_height: int, text_line_y: int, text_line_bottom: int) -> bool:
+def find_text_end_by_gap(image: np.ndarray, region: TextRegion) -> int:
     """
-    덩어리가 그래픽(아이콘/일러스트/사진)인지 판단
+    [핵심 함수] 텍스트가 끝나는 지점 찾기
     
-    그래픽의 특징:
-    1. 정사각형에 가까움 (아이콘)
-    2. 세로로 김 (일러스트, 인물사진)
-    3. 텍스트 행 높이보다 훨씬 큼
-    4. 현재 텍스트 행의 Y 범위를 벗어남 (여러 행에 걸침)
-    """
-    
-    # 기준값
-    min_graphic_size = text_line_height * 0.7  # 텍스트 높이의 70% 이상이면 고려 대상
-    
-    # 너무 작으면 텍스트 파편일 가능성
-    if blob_w < min_graphic_size and blob_h < min_graphic_size:
-        return False
-    
-    aspect_ratio = blob_w / blob_h if blob_h > 0 else 999
-    
-    # 조건 1: 정사각형에 가까운 덩어리 (0.5 ~ 2.0)
-    is_square = 0.5 <= aspect_ratio <= 2.0
-    
-    # 조건 2: 세로로 긴 덩어리 (aspect < 0.5, 즉 height > width * 2)
-    is_vertical = aspect_ratio < 0.5
-    
-    # 조건 3: 텍스트 행 높이의 1.5배 이상 큰 덩어리
-    is_tall = blob_h > text_line_height * 1.5
-    is_wide = blob_w > text_line_height * 1.5
-    is_large = is_tall or (is_square and is_wide)
-    
-    # 조건 4: 현재 텍스트 행의 Y 범위를 크게 벗어남
-    blob_top = blob_abs_y
-    blob_bottom = blob_abs_y + blob_h
-    extends_above = blob_top < text_line_y - 10
-    extends_below = blob_bottom > text_line_bottom + 10
-    spans_multiple_lines = extends_above or extends_below
-    
-    # 최종 판단: 위 조건 중 하나라도 해당되면 그래픽
-    if is_square and (is_large or blob_w > min_graphic_size):
-        return True
-    if is_vertical and blob_h > text_line_height:
-        return True
-    if is_large and spans_multiple_lines:
-        return True
-    if blob_h > text_line_height * 2:  # 텍스트 높이의 2배 이상이면 무조건 그래픽
-        return True
-    
-    return False
-
-
-def find_right_boundary(image: np.ndarray, region: TextRegion, max_lookahead: int = 500) -> int:
-    """
-    텍스트 행의 오른쪽 끝을 어디서 자를지 결정
-    그래픽(아이콘/일러스트/사진)을 만나면 그 전에서 멈춤
+    원리: 수평으로 스캔하면서 "두 글자 이상의 공백"이 연속되면 거기서 끊음
+    - 한 글자 너비 ≈ 텍스트 높이의 0.8~1.0배 (한글 기준)
+    - 두 글자 공백 = 텍스트 높이 * 1.5 이상의 빈 공간
     """
     binary = get_content_mask(image)
     img_h, img_w = binary.shape
     
     text_h = region.bounds['height']
-    text_y = region.bounds['y']
-    text_bottom = text_y + text_h
-    start_x = region.bounds['x'] + region.bounds['width']
+    x_start = region.bounds['x']
+    x_end = region.bounds['x'] + region.bounds['width']
+    y1 = max(0, region.bounds['y'])
+    y2 = min(img_h, region.bounds['y'] + text_h)
     
-    # 위아래 여유를 두고 탐색 (일러스트가 행 범위를 벗어날 수 있으므로)
-    search_y1 = max(0, text_y - text_h * 2)
-    search_y2 = min(img_h, text_bottom + text_h * 2)
-    search_x2 = min(img_w, start_x + max_lookahead)
+    # 두 글자 공백 기준 (텍스트 높이의 1.5배)
+    gap_threshold = int(text_h * 1.5)
     
-    if search_x2 <= start_x:
-        return region.bounds['x'] + region.bounds['width']
-    
-    # 넓은 영역에서 컨투어 찾기
-    roi = binary[search_y1:search_y2, start_x:search_x2]
+    # 현재 텍스트 영역 내에서 열(column)별 픽셀 합계 계산
+    roi = binary[y1:y2, x_start:x_end]
     if roi.size == 0:
-        return region.bounds['x'] + region.bounds['width']
+        return x_end
     
-    contours, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    col_sums = np.sum(roi, axis=0)
     
-    # 덩어리들 수집
-    blobs = []
-    for cnt in contours:
-        x, y, w, h = cv2.boundingRect(cnt)
-        if w < 5 or h < 5:
-            continue
-        abs_x = start_x + x
-        abs_y = search_y1 + y
-        blobs.append({
-            'x': x, 'y': y, 'w': w, 'h': h,
-            'abs_x': abs_x, 'abs_y': abs_y
-        })
+    # 오른쪽에서부터 공백 찾기
+    # 연속된 빈 열(col_sum == 0)이 gap_threshold 이상이면 거기서 끊음
+    last_content_x = x_start
+    gap_start = -1
     
-    # X 좌표로 정렬
-    blobs.sort(key=lambda b: b['x'])
-    
-    current_right = region.bounds['x'] + region.bounds['width']
-    
-    for blob in blobs:
-        abs_x = blob['abs_x']
-        abs_y = blob['abs_y']
-        w, h = blob['w'], blob['h']
+    for i, col_sum in enumerate(col_sums):
+        abs_x = x_start + i
         
-        # 이전 끝과 너무 멀리 떨어져 있으면 확장 중단
-        gap = abs_x - current_right
-        if gap > 100:
-            break
-        
-        # 그래픽인지 판단
-        if is_graphic_blob(w, h, blob['y'], abs_y, text_h, text_y, text_bottom):
-            # 그래픽을 만남 → 여기서 멈춤
-            break
-        
-        # 텍스트로 판단 → 이 영역까지 포함
-        # 단, 현재 텍스트 행의 Y 범위 안에 있는 것만
-        blob_cy = abs_y + h // 2
-        if text_y - 10 <= blob_cy <= text_bottom + 10:
-            current_right = abs_x + w
+        if col_sum > 0:
+            # 내용 있음
+            if gap_start != -1:
+                # 이전에 공백이 있었는데 다시 내용이 나옴
+                gap_width = abs_x - gap_start
+                if gap_width >= gap_threshold:
+                    # 두 글자 이상 공백 발견 → 공백 시작점에서 끊음
+                    return gap_start
+            
+            last_content_x = abs_x
+            gap_start = -1
+        else:
+            # 빈 열
+            if gap_start == -1:
+                gap_start = abs_x
     
-    return current_right
+    # 마지막까지 확인 (끝에 큰 공백이 있는 경우)
+    if gap_start != -1:
+        gap_width = x_end - gap_start
+        if gap_width >= gap_threshold:
+            return gap_start
+    
+    # 공백 없으면 마지막 내용 위치 + 약간의 여유
+    return min(last_content_x + int(text_h * 0.3), x_end)
 
 
-def expand_horizontal_bounds(image: np.ndarray, regions: List[TextRegion]) -> List[TextRegion]:
-    """행 단위로 오른쪽 경계 확장 (그래픽 전에서 멈춤)"""
+def trim_horizontal_bounds(image: np.ndarray, regions: List[TextRegion]) -> List[TextRegion]:
+    """각 행의 오른쪽 경계를 공백 기준으로 트리밍"""
     if not regions:
         return []
     
@@ -372,10 +312,11 @@ def expand_horizontal_bounds(image: np.ndarray, regions: List[TextRegion]) -> Li
         if r.is_inverted:
             continue
         
-        right_x = find_right_boundary(image, r)
+        # 공백 기준으로 끝점 찾기
+        right_x = find_text_end_by_gap(image, r)
         new_width = right_x - r.bounds['x']
         
-        if new_width > r.bounds['width']:
+        if new_width > 10:  # 최소 너비 보장
             r.bounds['width'] = new_width
     
     return regions
@@ -397,7 +338,9 @@ def run_enhanced_ocr(image: np.ndarray) -> Dict:
     all_raw_regions = normal_regions + inverted_regions
     merged_regions = merge_regions_by_row(all_raw_regions)
     vertical_refined = refine_vertical_boundaries_by_projection(image, merged_regions)
-    final_regions = expand_horizontal_bounds(image, vertical_refined)
+    
+    # 공백 기준으로 오른쪽 경계 트리밍
+    final_regions = trim_horizontal_bounds(image, vertical_refined)
     
     final_normal = [r for r in final_regions if not r.is_inverted]
     final_inverted = [r for r in final_regions if r.is_inverted]
