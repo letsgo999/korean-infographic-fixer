@@ -309,7 +309,7 @@ def render_step2_detect():
             st.rerun()
 
 def render_step3_edit():
-    """Step 3: 텍스트 편집 (Duplicate Key 에러 수정 버전)"""
+    """Step 3: 텍스트 편집 (폰트 선택 및 장평 조절 기능 추가)"""
     st.header("✏️ Step 3: 텍스트 편집")
     
     if not st.session_state.text_regions:
@@ -319,138 +319,96 @@ def render_step3_edit():
     image = st.session_state.original_image
     regions = st.session_state.text_regions
     
-    # 레이아웃
+    # fonts 폴더의 폰트 파일 목록 읽어오기
+    fonts_dir = os.path.join(os.path.dirname(__file__), 'fonts')
+    if not os.path.exists(fonts_dir):
+        os.makedirs(fonts_dir)
+        
+    available_fonts = [f for f in os.listdir(fonts_dir) if f.lower().endswith('.ttf')]
+    if not available_fonts:
+        st.error("fonts 폴더에 .ttf 폰트 파일이 없습니다!")
+        available_fonts = ["Default"]
+
     col1, col2 = st.columns([1, 1])
     
     with col1:
         st.subheader("📋 텍스트 영역 목록")
         
-        # 필터링 옵션
-        filter_option = st.radio(
-            "필터",
-            ["전체", "일반", "역상", "수동 추가"],
-            horizontal=True
-        )
+        filter_option = st.radio("필터", ["전체", "일반", "역상", "수동 추가"], horizontal=True)
         
-        # 필터링 적용
-        if filter_option == "일반":
-            filtered = [r for r in regions if not r.get('is_inverted') and not r.get('is_manual')]
-        elif filter_option == "역상":
-            filtered = [r for r in regions if r.get('is_inverted')]
-        elif filter_option == "수동 추가":
-            filtered = [r for r in regions if r.get('is_manual')]
-        else:
-            filtered = regions
+        if filter_option == "일반": filtered = [r for r in regions if not r.get('is_inverted') and not r.get('is_manual')]
+        elif filter_option == "역상": filtered = [r for r in regions if r.get('is_inverted')]
+        elif filter_option == "수동 추가": filtered = [r for r in regions if r.get('is_manual')]
+        else: filtered = regions
         
-        # 영역별 편집 폼
-        # enumerate(filtered)의 인덱스 i를 key에 추가하여 중복 방지
         for i, region in enumerate(filtered):
             region_id = region['id']
-            
-            # Expander 제목 설정
             display_text = region['text'][:30] + "..." if len(region['text']) > 30 else region['text']
             
             with st.expander(f"📝 {i+1}. {display_text}", expanded=False):
-                # 원본 텍스트 및 정보
-                st.caption(f"ID: {region_id} | 신뢰도: {region['confidence']}%")
+                # 수정 텍스트 입력
+                edited = st.text_area("수정된 텍스트", value=st.session_state.edited_texts.get(region_id, region['text']), key=f"text_{region_id}_{i}", height=80)
                 
-                # 수정 텍스트 입력 (Key에 _i 추가)
-                edited = st.text_area(
-                    "수정된 텍스트",
-                    value=st.session_state.edited_texts.get(region_id, region['text']),
-                    key=f"text_{region_id}_{i}", 
-                    height=80
-                )
+                # --- [UI 업데이트] 3단 레이아웃 (폰트선택 / 크기 / 장평) ---
+                c1, c2, c3 = st.columns([2, 1, 1])
                 
-                # 스타일 설정
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    font_size = st.number_input(
-                        "폰트 크기",
-                        min_value=8,
-                        max_value=72,
-                        value=int(region.get('suggested_font_size', 16)),
-                        key=f"size_{region_id}_{i}"
-                    )
-                with col_b:
-                    text_color = st.color_picker(
-                        "글자색",
-                        value=region.get('text_color', '#333333'),
-                        key=f"color_{region_id}_{i}"
-                    )
+                with c1:
+                    # 폰트 파일 선택 (기본값: 기존 설정 or 첫번째 폰트)
+                    current_font = region.get('font_filename', available_fonts[0])
+                    if current_font not in available_fonts: current_font = available_fonts[0]
+                    
+                    selected_font = st.selectbox("폰트 선택", options=available_fonts, index=available_fonts.index(current_font), key=f"font_{region_id}_{i}")
                 
-                # 저장 버튼 (Key에 _i 추가)
+                with c2:
+                    font_size = st.number_input("크기", min_value=8, max_value=200, value=int(region.get('suggested_font_size', 16)), key=f"size_{region_id}_{i}")
+                    
+                with c3:
+                    # 장평 조절 슬라이더 (50% ~ 150%)
+                    width_scale = st.number_input("장평(%)", min_value=50, max_value=200, value=int(region.get('width_scale', 100)), step=5, key=f"scale_{region_id}_{i}")
+
+                # 글자색
+                text_color = st.color_picker("글자색", value=region.get('text_color', '#333333'), key=f"color_{region_id}_{i}")
+                
                 if st.button("💾 저장", key=f"save_{region_id}_{i}"):
                     st.session_state.edited_texts[region_id] = edited
-                    # 영역 정보도 업데이트
                     for r in st.session_state.text_regions:
                         if r['id'] == region_id:
                             r['text'] = edited
                             r['suggested_font_size'] = font_size
                             r['text_color'] = text_color
+                            r['font_filename'] = selected_font # 폰트 저장
+                            r['width_scale'] = width_scale     # 장평 저장
                             break
                     st.success("저장되었습니다!")
                     st.rerun()
     
     with col2:
         st.subheader("🖼️ 미리보기")
-        
-        # 현재 편집 상태 반영한 미리보기
-        visualized = draw_regions_on_image(
-            image, 
-            regions, 
-            st.session_state.edited_texts
-        )
-        
-        st.image(
-            cv2.cvtColor(visualized, cv2.COLOR_BGR2RGB),
-            caption="편집 미리보기 (🟣 마젠타: 수정됨)",
-            use_container_width=True
-        )
+        visualized = draw_regions_on_image(image, regions, st.session_state.edited_texts)
+        st.image(cv2.cvtColor(visualized, cv2.COLOR_BGR2RGB), caption="편집 미리보기", use_container_width=True)
         
         st.divider()
-        
-        # 수동 영역 추가
         st.subheader("➕ 수동 영역 추가")
-        
         with st.form("manual_region_form"):
             new_text = st.text_input("텍스트 내용")
-            
             col_x, col_y = st.columns(2)
-            with col_x:
-                x = st.number_input("X 좌표", min_value=0, value=50)
-                width = st.number_input("너비", min_value=10, value=200)
-            with col_y:
-                y = st.number_input("Y 좌표", min_value=0, value=50)
-                height = st.number_input("높이", min_value=10, value=30)
-            
-            style = st.selectbox("스타일", ["body", "title", "subtitle", "caption"])
-            
+            with col_x: x = st.number_input("X 좌표", min_value=0, value=50); width = st.number_input("너비", min_value=10, value=200)
+            with col_y: y = st.number_input("Y 좌표", min_value=0, value=50); height = st.number_input("높이", min_value=10, value=30)
             if st.form_submit_button("영역 추가"):
                 if new_text:
-                    new_region = create_manual_region(
-                        x=x, y=y, width=width, height=height,
-                        text=new_text,
-                        style_tag=style
-                    )
+                    from modules import create_manual_region
+                    new_region = create_manual_region(x=x, y=y, width=width, height=height, text=new_text)
+                    # 수동 영역 기본값 설정
+                    new_region.font_filename = available_fonts[0]
                     st.session_state.text_regions.append(new_region.to_dict())
-                    st.success("영역이 추가되었습니다!")
-                    st.rerun()
-                else:
-                    st.error("텍스트를 입력하세요.")
-    
+                    st.success("추가됨!"); st.rerun()
+
     st.divider()
-    
-    # 네비게이션
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("⬅️ 이전 단계"):
-            st.session_state.current_step = 2
-            st.rerun()
+        if st.button("⬅️ 이전 단계"): st.session_state.current_step = 2; st.rerun()
     with col2:
-        if st.button("📤 내보내기로 이동", type="primary"):
-            st.session_state.current_step = 4
-            st.rerun()
+        if st.button("📤 내보내기로 이동", type="primary"): st.session_state.current_step = 4; st.rerun()
 
 def render_step4_export(settings: dict):
     """Step 4: 내보내기 (수정된 영역만 반영 버전)"""
