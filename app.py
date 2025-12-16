@@ -453,7 +453,7 @@ def render_step3_edit():
             st.rerun()
 
 def render_step4_export(settings: dict):
-    """Step 4: 내보내기"""
+    """Step 4: 내보내기 (수정된 영역만 반영 버전)"""
     st.header("📤 Step 4: 내보내기")
     
     if not st.session_state.text_regions:
@@ -463,21 +463,27 @@ def render_step4_export(settings: dict):
     image = st.session_state.original_image
     regions = st.session_state.text_regions
     
-    # 최종 미리보기
-    col1, col2 = st.columns([2, 1])
+    # ------------------------------------------------------------------
+    # [핵심 로직 변경] 수정된 영역만 골라내기
+    # ------------------------------------------------------------------
+    edited_ids = set(st.session_state.edited_texts.keys())
     
-    with col1:
-        st.subheader("최종 미리보기")
+    target_regions = []
+    target_objects = [] # 클래스 객체용
+    
+    for r in regions:
+        # 1. 사용자가 내용을 수정하고 [저장]을 누른 영역
+        is_edited = r['id'] in edited_ids
+        # 2. 사용자가 [수동 영역 추가]로 만든 영역
+        is_manual = r.get('is_manual', False)
         
-        # 배경 생성 (텍스트 제거)
-        inpainter = create_inpainter("simple_fill")
-        
-        # TextRegion 객체로 변환
-        region_objects = []
-        for r in regions:
-            region_objects.append(TextRegion(
+        if is_edited or is_manual:
+            target_regions.append(r)
+            
+            # TextRegion 객체 생성 (Inpainter/Renderer용)
+            target_objects.append(TextRegion(
                 id=r['id'],
-                text=r['text'],
+                text=r['text'], # 이미 수정된 텍스트가 들어있음
                 confidence=r['confidence'],
                 bounds=r['bounds'],
                 is_inverted=r.get('is_inverted', False),
@@ -488,45 +494,52 @@ def render_step4_export(settings: dict):
                 bg_color=r.get('bg_color', '#FFFFFF'),
                 font_family=r.get('font_family', settings['font_family'])
             ))
+            
+    # 수정된 내역이 없으면 경고 표시
+    if not target_regions:
+        st.info("💡 수정된(저장된) 텍스트 영역이 없습니다. 원본 이미지를 그대로 사용합니다.")
+        st.session_state.processed_image = image.copy()
+        final_image = image.copy()
+    else:
+        st.success(f"✅ 총 {len(target_regions)}개의 수정된 영역만 이미지에 반영합니다.")
         
-        # 배경 이미지 생성
-        background = inpainter.remove_all_text_regions(image, region_objects)
+        # 1. 배경 지우기 (수정 대상 영역만 지움)
+        inpainter = create_inpainter("simple_fill")
+        background = inpainter.remove_all_text_regions(image, target_objects)
         st.session_state.background_image = background
         
-        # 합성
+        # 2. 텍스트 다시 쓰기 (수정 대상 영역만 씀)
         renderer = CompositeRenderer()
         final_image = renderer.composite(
             background,
-            region_objects,
+            target_objects,
             st.session_state.edited_texts
         )
         st.session_state.processed_image = final_image
-        
+
+    # ------------------------------------------------------------------
+    # 최종 미리보기 및 다운로드 UI
+    # ------------------------------------------------------------------
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.subheader("최종 미리보기")
         st.image(
             cv2.cvtColor(final_image, cv2.COLOR_BGR2RGB),
-            caption="최종 결과",
+            caption="최종 결과 (수정된 부분만 반영됨)",
             use_container_width=True
         )
     
     with col2:
         st.subheader("내보내기 옵션")
-        
         output_formats = settings['output_formats']
-        
-        # 파일명 입력
-        filename = st.text_input(
-            "파일명",
-            value=f"infographic_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        )
+        filename = st.text_input("파일명", value=f"infographic_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
         
         st.divider()
         
-        # 내보내기 버튼
         if st.button("📥 파일 생성 및 다운로드", type="primary"):
             with st.spinner("파일 생성 중..."):
                 exporter = MultiFormatExporter()
-                
-                # 임시 디렉토리에 저장
                 with tempfile.TemporaryDirectory() as tmp_dir:
                     results = exporter.export_all(
                         final_image,
@@ -534,8 +547,6 @@ def render_step4_export(settings: dict):
                         filename,
                         formats=[f.lower() for f in output_formats]
                     )
-                    
-                    # 다운로드 버튼 생성
                     for fmt, filepath in results.items():
                         if filepath and Path(filepath).exists():
                             with open(filepath, 'rb') as f:
@@ -547,32 +558,14 @@ def render_step4_export(settings: dict):
                                 )
         
         st.divider()
-        
-        # 메타데이터 다운로드
         if st.button("📋 메타데이터 다운로드"):
             builder = MetadataBuilder()
-            builder.set_image_info(
-                filename=st.session_state.uploaded_image or "image",
-                width=image.shape[1],
-                height=image.shape[0]
-            )
-            
-            # TextRegion 객체로 변환하여 설정
+            builder.set_image_info(filename=st.session_state.uploaded_image or "image", width=image.shape[1], height=image.shape[0])
             builder.metadata['text_regions'] = regions
             builder._update_summary()
+            st.download_button(label="📥 JSON 메타데이터", data=builder.to_json(), file_name=f"{filename}_metadata.json", mime="application/json")
             
-            metadata_json = builder.to_json()
-            
-            st.download_button(
-                label="📥 JSON 메타데이터",
-                data=metadata_json,
-                file_name=f"{filename}_metadata.json",
-                mime="application/json"
-            )
-    
     st.divider()
-    
-    # 네비게이션
     if st.button("⬅️ 이전 단계"):
         st.session_state.current_step = 3
         st.rerun()
