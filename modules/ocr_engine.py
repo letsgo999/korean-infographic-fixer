@@ -1,6 +1,6 @@
 """
 OCR Engine Module
-텍스트 추출, 좌표 인식 및 [강력한 겹침 방지]가 적용된 모듈
+텍스트 추출, 좌표 인식, [픽셀 기반 정밀 축소] 및 [행간 분리]가 적용된 모듈
 """
 import cv2
 import numpy as np
@@ -152,52 +152,105 @@ def merge_regions_by_row(regions: List[TextRegion]) -> List[TextRegion]:
         merged_rows.append(new_region)
     return merged_rows
 
+def optimize_vertical_bounds(image: np.ndarray, regions: List[TextRegion]) -> List[TextRegion]:
+    """
+    [NEW] 픽셀 기반 박스 축소 (Tightening)
+    박스 안의 실제 글자 픽셀을 분석하여, 위아래 빈 공간을 잘라냅니다.
+    이것이 '제품의 매력...' 같은 박스가 위로 치솟는 것을 막아줍니다.
+    """
+    if not regions: return []
+    
+    # 그레이스케일 변환 및 이진화 (글자는 검정, 배경은 흰색 가정 또는 반대)
+    # OCR 정확도를 위해 Otsu 이진화를 사용해 글자 영역을 확실히 찾습니다.
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image
+        
+    # 글자가 어두운 색이라고 가정하고 이진화 (배경이 밝음)
+    # 인포그래픽 특성상 글자가 밝을 수도 있으므로, 박스 내부의 분산 등을 볼 수 있지만
+    # 여기서는 일반적인 adaptive thresholding을 사용합니다.
+    binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
+    
+    for r in regions:
+        x, y = r.bounds['x'], r.bounds['y']
+        w, h = r.bounds['width'], r.bounds['height']
+        
+        # 이미지 범위를 벗어나지 않게 클핑
+        x = max(0, x); y = max(0, y)
+        w = min(w, image.shape[1] - x); h = min(h, image.shape[0] - y)
+        
+        if w <= 0 or h <= 0: continue
+        
+        # 해당 영역(ROI) 추출
+        roi = binary[y:y+h, x:x+w]
+        
+        # 수평 투영 (Horizontal Projection): 각 행(row)의 픽셀 합을 구함
+        # 글자가 있는 행은 값이 크고, 빈 공간은 0에 가까움
+        row_sum = cv2.reduce(roi, 1, cv2.REDUCE_SUM, dtype=cv2.CV_32F).flatten()
+        
+        # 픽셀이 있는 첫 번째 행(Top)과 마지막 행(Bottom) 찾기
+        non_zero_indices = np.where(row_sum > (w * 0.05 * 255)) # 노이즈(5%) 제외하고 글자 픽셀 찾기
+        
+        if len(non_zero_indices[0]) > 0:
+            top_offset = non_zero_indices[0][0]
+            bottom_offset = non_zero_indices[0][-1]
+            
+            # 실제 글자 높이
+            new_h = bottom_offset - top_offset + 1
+            
+            # 너무 작아지면(노이즈만 잡은 경우) 무시하고, 의미 있게 줄어들면 적용
+            if new_h > 5 and new_h < h:
+                # 좌표 업데이트 (Top은 아래로 내려가고, Height는 줄어듦)
+                r.bounds['y'] = y + top_offset
+                r.bounds['height'] = new_h
+                
+                # 디버깅용: "조여졌다"는 것을 알 수 있음
+                # print(f"Region {r.id} tightened: y {y}->{r.bounds['y']}, h {h}->{new_h}")
+                
+    return regions
+
 def prevent_vertical_overlaps(regions: List[TextRegion], buffer: int = 5) -> List[TextRegion]:
     """
-    [강력한 겹침 방지] 이중 루프 + 수평 교차 검사
-    모든 박스 쌍을 전수 조사하여, 가로로 겹치는 박스들 사이의 세로 침범을 원천 차단합니다.
+    [강력한 행간 분리] 
+    픽셀 축소 후에도 겹치는 박스가 있다면, '빈 공백'을 기준으로 강제 분할합니다.
     """
-    if not regions:
-        return []
-        
-    # Y 좌표 순으로 정렬 (위 -> 아래)
+    if not regions: return []
     regions.sort(key=lambda r: r.bounds['y'])
     
-    # 이중 루프: i는 윗박스, j는 아랫박스 후보
     for i in range(len(regions)):
         for j in range(i + 1, len(regions)):
             upper = regions[i]
             lower = regions[j]
             
-            # 1. 아랫박스가 윗박스보다 훨씬 밑에 있어서 겹칠 가능성이 0이면 패스
-            # (최적화를 위해 추가: 윗박스 바닥 + 10px보다 아랫박스 천장이 더 아래면 검사 불필요)
             if lower.bounds['y'] > (upper.bounds['y'] + upper.bounds['height'] + 10):
                 continue
 
-            # 2. [핵심] 수평(X축) 겹침 확인
-            # 서로 다른 컬럼에 있는 박스라면 세로로 겹쳐도 상관없음 (예: 좌측 텍스트, 우측 텍스트)
             u_left, u_right = upper.bounds['x'], upper.bounds['x'] + upper.bounds['width']
             l_left, l_right = lower.bounds['x'], lower.bounds['x'] + lower.bounds['width']
             
-            # 교차 구간 계산
             intersect_x1 = max(u_left, l_left)
             intersect_x2 = min(u_right, l_right)
             
-            # 교차 폭이 존재하면 (= 같은 세로 라인 상에 있다면)
+            # 가로로 겹치는 구간이 있다면 (같은 컬럼)
             if intersect_x2 > intersect_x1:
-                # 3. 수직 겹침 확인 및 자르기
                 u_bottom = upper.bounds['y'] + upper.bounds['height']
                 l_top = lower.bounds['y']
                 
-                # 윗박스 바닥이 아랫박스 천장보다 아래거나, 여유공간(buffer) 안쪽으로 들어왔다면
-                if u_bottom >= (l_top - buffer):
-                    # 윗박스 높이 강제 조절
-                    new_height = (l_top - buffer) - upper.bounds['y']
+                # 세로로 겹친다면
+                if u_bottom >= l_top:
+                    # 겹치는 구간의 중간 지점을 찾음
+                    mid_y = (u_bottom + l_top) // 2
                     
-                    # 높이가 너무 작아져서(15px 미만) 아예 사라지는 것 방지
-                    upper.bounds['height'] = max(15, int(new_height))
+                    # 윗 박스는 중간 지점보다 조금 위에서 끝내고
+                    upper.bounds['height'] = max(10, (mid_y - buffer) - upper.bounds['y'])
                     
-    # ID 재할당
+                    # 아랫 박스는 중간 지점보다 조금 아래에서 시작 (Top 이동, 높이 축소)
+                    original_bottom = lower.bounds['y'] + lower.bounds['height']
+                    new_top = mid_y + buffer
+                    lower.bounds['y'] = new_top
+                    lower.bounds['height'] = max(10, original_bottom - new_top)
+
     for i, r in enumerate(regions):
         prefix = "inv" if r.is_inverted else "ocr"
         r.id = f"{prefix}_{i:03d}"
@@ -215,11 +268,14 @@ def run_enhanced_ocr(image: np.ndarray) -> Dict:
     
     all_raw_regions = normal_regions + inverted_regions
     
-    # 1. 행 단위로 합치기
+    # 1. 행 단위 합치기
     merged_regions = merge_regions_by_row(all_raw_regions)
     
-    # 2. [강력한] 수직 겹침 해결
-    final_regions = prevent_vertical_overlaps(merged_regions)
+    # 2. [NEW] 픽셀 기반 박스 축소 (Tightening) - 여기서 공백을 확보합니다.
+    tightened_regions = optimize_vertical_bounds(image, merged_regions)
+    
+    # 3. [UPDATED] 그래도 겹치면 강제 분리
+    final_regions = prevent_vertical_overlaps(tightened_regions)
     
     final_normal = [r for r in final_regions if not r.is_inverted]
     final_inverted = [r for r in final_regions if r.is_inverted]
