@@ -365,7 +365,7 @@ def render_step3_edit():
                     
                 with c3:
                     # [변경] 기본값 80% (장평)
-                    default_scale = int(region.get('width_scale', 80))
+                    default_scale = int(region.get('width_scale', 90))
                     width_scale = st.number_input("장평(%)", min_value=50, max_value=200, value=default_scale, step=5, key=f"scale_{region_id}_{i}")
 
                 text_color = st.color_picker("글자색", value=region.get('text_color', '#333333'), key=f"color_{region_id}_{i}")
