@@ -1,9 +1,9 @@
 """
 OCR Engine Module
-[v8 - 병합 조건 강화] 
-1. X축 간격이 3칸 이상이면 같은 행이어도 병합 안함
-2. 수평 확장 로직 제거 (필요 없음)
-3. 단순하고 정확한 영역 지정
+[v9 - 수직 연속성 체크] 
+1. 행 병합 기본 유지
+2. 수평 확장 시 "현재 행의 Y 범위를 벗어나는 픽셀"이 연속되면 끊음
+3. 그림은 여러 행에 걸치므로, 행 범위 밖 픽셀로 감지
 """
 import cv2
 import numpy as np
@@ -139,14 +139,8 @@ def is_valid_text(text: str) -> bool:
     return True
 
 
-def merge_regions_by_row_strict(regions: List[TextRegion]) -> List[TextRegion]:
-    """
-    [v8 핵심] 행 단위 병합 - X축 간격 조건 추가
-    
-    병합 조건:
-    1. 같은 Y축 라인 (기존)
-    2. X축 간격이 3칸 미만 (신규)
-    """
+def merge_regions_by_row(regions: List[TextRegion]) -> List[TextRegion]:
+    """행 단위 병합 - 같은 Y축 라인은 하나의 행으로"""
     if not regions: return []
     regions.sort(key=lambda r: r.bounds['y'])
     merged_rows = []
@@ -154,68 +148,36 @@ def merge_regions_by_row_strict(regions: List[TextRegion]) -> List[TextRegion]:
     while regions:
         current = regions.pop(0)
         current_cy = current.bounds['y'] + current.bounds['height'] // 2
-        current_h = current.bounds['height']
-        
-        # 3칸 공백 기준 (글자 너비 ≈ 높이)
-        max_gap = current_h * 2.5
-        
-        row_candidates = []
+        row_group = [current]
         others = []
         
-        # 같은 Y축 라인의 영역들 수집
         for r in regions:
             r_cy = r.bounds['y'] + r.bounds['height'] // 2
-            height_ref = max(current_h, r.bounds['height'])
+            height_ref = max(current.bounds['height'], r.bounds['height'])
             if abs(current_cy - r_cy) < (height_ref * 0.5):
-                row_candidates.append(r)
+                row_group.append(r)
             else:
                 others.append(r)
         
         regions = others
+        row_group.sort(key=lambda r: r.bounds['x'])
         
-        # X축 순서로 정렬
-        row_candidates.sort(key=lambda r: r.bounds['x'])
+        min_x = min(r.bounds['x'] for r in row_group)
+        min_y = min(r.bounds['y'] for r in row_group)
+        max_x = max(r.bounds['x'] + r.bounds['width'] for r in row_group)
+        max_y = max(r.bounds['y'] + r.bounds['height'] for r in row_group)
         
-        # 현재 그룹 (current부터 시작)
-        current_group = [current]
-        
-        # X축 간격 조건으로 연속된 것만 병합
-        for candidate in row_candidates:
-            last_in_group = current_group[-1]
-            last_right = last_in_group.bounds['x'] + last_in_group.bounds['width']
-            candidate_left = candidate.bounds['x']
-            
-            gap = candidate_left - last_right
-            
-            if gap < max_gap:
-                # 간격이 작으면 같은 그룹
-                current_group.append(candidate)
-            else:
-                # 간격이 크면 별도 영역으로 분리 → 나중에 처리
-                regions.append(candidate)
-        
-        # 그룹을 하나의 영역으로 병합
-        current_group.sort(key=lambda r: r.bounds['x'])
-        
-        min_x = min(r.bounds['x'] for r in current_group)
-        min_y = min(r.bounds['y'] for r in current_group)
-        max_x = max(r.bounds['x'] + r.bounds['width'] for r in current_group)
-        max_y = max(r.bounds['y'] + r.bounds['height'] for r in current_group)
-        
-        full_text = " ".join([r.text for r in current_group])
-        avg_conf = sum(r.confidence for r in current_group) / len(current_group)
+        full_text = " ".join([r.text for r in row_group])
+        avg_conf = sum(r.confidence for r in row_group) / len(row_group)
         
         new_region = TextRegion(
             id="merged",
             text=full_text,
             confidence=avg_conf,
             bounds={'x': min_x, 'y': min_y, 'width': max_x - min_x, 'height': max_y - min_y},
-            is_inverted=current_group[0].is_inverted
+            is_inverted=row_group[0].is_inverted
         )
         merged_rows.append(new_region)
-        
-        # 남은 regions 다시 정렬
-        regions.sort(key=lambda r: r.bounds['y'])
     
     return merged_rows
 
@@ -280,6 +242,138 @@ def refine_vertical_boundaries_by_projection(image: np.ndarray, regions: List[Te
     return regions
 
 
+def has_vertical_overflow(binary: np.ndarray, x: int, text_y: int, text_h: int, check_width: int = 5) -> bool:
+    """
+    특정 X 위치에서 텍스트 행의 Y 범위를 벗어나는 픽셀이 있는지 확인
+    
+    텍스트: 행 범위 내에만 픽셀 존재
+    그림: 행 범위를 벗어나는 픽셀 존재 (위 또는 아래로 삐져나옴)
+    """
+    img_h, img_w = binary.shape
+    
+    if x < 0 or x >= img_w:
+        return False
+    
+    # 체크할 열 범위
+    x_end = min(x + check_width, img_w)
+    
+    # 텍스트 행의 Y 범위 (약간의 여유 포함)
+    margin = max(3, text_h // 4)
+    row_top = text_y - margin
+    row_bottom = text_y + text_h + margin
+    
+    # 행 범위 위쪽 체크 (0 ~ row_top)
+    if row_top > 0:
+        above_roi = binary[0:row_top, x:x_end]
+        if above_roi.size > 0 and np.sum(above_roi > 0) > (above_roi.size * 0.02):
+            return True
+    
+    # 행 범위 아래쪽 체크 (row_bottom ~ img_h)
+    if row_bottom < img_h:
+        below_roi = binary[row_bottom:img_h, x:x_end]
+        if below_roi.size > 0 and np.sum(below_roi > 0) > (below_roi.size * 0.02):
+            return True
+    
+    return False
+
+
+def find_text_end_by_vertical_check(binary: np.ndarray, region: TextRegion) -> int:
+    """
+    [v9 핵심] 수직 연속성 체크로 텍스트 끝점 찾기
+    
+    원리:
+    - 오른쪽으로 스캔하면서 각 열을 체크
+    - "행 범위를 벗어나는 픽셀"이 연속으로 나타나면 = 그림 시작
+    - 그 직전에서 끊음
+    """
+    img_h, img_w = binary.shape
+    
+    text_y = region.bounds['y']
+    text_h = region.bounds['height']
+    x_start = region.bounds['x']
+    x_end = region.bounds['x'] + region.bounds['width']
+    
+    # 2칸 공백 기준
+    char_width = text_h
+    gap_threshold = int(char_width * 1.5)
+    
+    # 행 범위 내의 ROI
+    row_top = max(0, text_y)
+    row_bottom = min(img_h, text_y + text_h)
+    roi = binary[row_top:row_bottom, x_start:x_end]
+    
+    if roi.size == 0:
+        return x_end
+    
+    col_sums = np.sum(roi, axis=0)
+    
+    last_content_x = x_start
+    gap_start = -1
+    overflow_start = -1
+    overflow_count = 0
+    
+    for i, col_sum in enumerate(col_sums):
+        abs_x = x_start + i
+        
+        # 수직 오버플로우 체크 (행 범위 밖에 픽셀이 있는지)
+        has_overflow = has_vertical_overflow(binary, abs_x, text_y, text_h, check_width=3)
+        
+        if has_overflow:
+            if overflow_start == -1:
+                overflow_start = abs_x
+            overflow_count += 1
+            
+            # 연속 10픽셀 이상 오버플로우 = 그림 영역 확실
+            if overflow_count >= 10:
+                # 오버플로우 시작점 직전에서 끊음
+                return max(last_content_x, overflow_start - 5)
+        else:
+            overflow_start = -1
+            overflow_count = 0
+        
+        # 기존 공백 체크도 유지
+        if col_sum > 0:
+            if gap_start != -1:
+                gap_width = abs_x - gap_start
+                if gap_width >= gap_threshold:
+                    return gap_start
+            
+            if not has_overflow:
+                last_content_x = abs_x
+            gap_start = -1
+        else:
+            if gap_start == -1:
+                gap_start = abs_x
+    
+    # 마지막 공백 체크
+    if gap_start != -1:
+        gap_width = x_end - gap_start
+        if gap_width >= gap_threshold:
+            return gap_start
+    
+    return min(last_content_x + int(char_width * 0.3), x_end)
+
+
+def trim_horizontal_bounds(image: np.ndarray, regions: List[TextRegion]) -> List[TextRegion]:
+    """각 행의 오른쪽 경계를 수직 연속성 + 공백 기준으로 트리밍"""
+    if not regions:
+        return []
+    
+    binary = get_content_mask(image)
+    
+    for r in regions:
+        if r.is_inverted:
+            continue
+        
+        right_x = find_text_end_by_vertical_check(binary, r)
+        new_width = right_x - r.bounds['x']
+        
+        if new_width > 10:
+            r.bounds['width'] = new_width
+    
+    return regions
+
+
 def run_enhanced_ocr(image: np.ndarray) -> Dict:
     """메인 OCR 함수"""
     ocr_engine = OCREngine()
@@ -294,12 +388,11 @@ def run_enhanced_ocr(image: np.ndarray) -> Dict:
         inverted_regions.extend(inv_texts)
     
     all_raw_regions = normal_regions + inverted_regions
+    merged_regions = merge_regions_by_row(all_raw_regions)
+    vertical_refined = refine_vertical_boundaries_by_projection(image, merged_regions)
     
-    # [v8 핵심] X축 간격 조건이 추가된 병합
-    merged_regions = merge_regions_by_row_strict(all_raw_regions)
-    
-    # 수직 경계 정제
-    final_regions = refine_vertical_boundaries_by_projection(image, merged_regions)
+    # [v9] 수직 연속성 체크로 트리밍
+    final_regions = trim_horizontal_bounds(image, vertical_refined)
     
     final_normal = [r for r in final_regions if not r.is_inverted]
     final_inverted = [r for r in final_regions if r.is_inverted]
