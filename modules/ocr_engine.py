@@ -1,6 +1,6 @@
 """
 OCR Engine Module
-텍스트 추출 및 좌표 인식을 담당하는 핵심 모듈 (Data Structure Update)
+텍스트 추출 및 좌표 인식을 담당하는 핵심 모듈 (Defaults Updated: Size 14, Width 80%)
 """
 import cv2
 import numpy as np
@@ -18,14 +18,15 @@ class TextRegion:
     bounds: Dict[str, int]
     is_inverted: bool = False
     style_tag: str = "body"
-    suggested_font_size: int = 16
+    
+    # [설정 변경] 기본 폰트 크기 14, 기본 장평 80%
+    suggested_font_size: int = 14  
     text_color: str = "#000000"
     bg_color: str = "#FFFFFF"
     
-    # [NEW] 폰트 파일명과 장평(%) 옵션 추가
-    font_family: str = "Noto Sans KR" 
-    font_filename: str = None  # 구체적인 폰트 파일명 (예: NotoSansKR-Bold.ttf)
-    width_scale: int = 100     # 장평 (기본 100%)
+    font_family: str = "Noto Sans KR"
+    font_filename: str = None
+    width_scale: int = 80  # [설정 변경] 장평 기본값 80
     
     font_weight: str = "Regular"
     is_manual: bool = False
@@ -36,10 +37,8 @@ class TextRegion:
     def to_dict(self) -> Dict:
         return asdict(self)
 
-# ... (이하 OCREngine, InvertedRegionDetector 등 나머지 클래스와 함수들은 기존과 동일하므로 유지)
-# 기존 코드의 나머지 부분은 그대로 두셔도 됩니다. 
-# 만약 복사가 번거로우시다면, 위 @dataclass 부분만 기존 파일의 앞부분에 덮어쓰셔도 됩니다.
-# 하지만 안전을 위해 아래 전체 코드를 제공합니다.
+# ... (이하 OCREngine 클래스부터 끝까지는 기존 코드와 동일하므로 유지)
+# 아래 내용은 복사 편의를 위해 전체를 다시 적어드립니다.
 
 class OCREngine:
     def __init__(self, lang: str = "kor+eng", min_confidence: int = 50):
@@ -178,6 +177,10 @@ def run_enhanced_ocr(image: np.ndarray) -> Dict:
 def group_regions_by_lines(regions: List[TextRegion]) -> List[TextRegion]: return regions
 
 def create_manual_region(x: int, y: int, width: int, height: int, text: str, style_tag: str = "body") -> TextRegion:
+    # [설정 변경] 수동 생성 시에도 14px, 80% 적용
     return TextRegion(
-        id=f"manual_{int(x)}_{int(y)}", text=text, confidence=100.0, bounds={'x': x, 'y': y, 'width': width, 'height': height}, is_inverted=False, is_manual=True, style_tag=style_tag
+        id=f"manual_{int(x)}_{int(y)}", text=text, confidence=100.0, 
+        bounds={'x': x, 'y': y, 'width': width, 'height': height}, 
+        is_inverted=False, is_manual=True, style_tag=style_tag,
+        suggested_font_size=14, width_scale=80
     )
