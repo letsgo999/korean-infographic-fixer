@@ -1,6 +1,6 @@
 """
 OCR Engine Module
-텍스트 추출, 좌표 인식, [픽셀 기반 정밀 축소] 및 [행간 분리]가 적용된 모듈
+텍스트 추출 및 좌표 인식 (Pixel-based Projection Split)
 """
 import cv2
 import numpy as np
@@ -128,6 +128,7 @@ def is_valid_text(text: str) -> bool:
     return True
 
 def merge_regions_by_row(regions: List[TextRegion]) -> List[TextRegion]:
+    # 1차 그룹핑: Y좌표가 비슷하면 무조건 한 줄로 합침 (사용자가 만족했던 그 로직)
     if not regions: return []
     regions.sort(key=lambda r: r.bounds['y'])
     merged_rows = []
@@ -152,105 +153,81 @@ def merge_regions_by_row(regions: List[TextRegion]) -> List[TextRegion]:
         merged_rows.append(new_region)
     return merged_rows
 
-def optimize_vertical_bounds(image: np.ndarray, regions: List[TextRegion]) -> List[TextRegion]:
+def refine_vertical_boundaries_by_projection(image: np.ndarray, regions: List[TextRegion]) -> List[TextRegion]:
     """
-    [NEW] 픽셀 기반 박스 축소 (Tightening)
-    박스 안의 실제 글자 픽셀을 분석하여, 위아래 빈 공간을 잘라냅니다.
-    이것이 '제품의 매력...' 같은 박스가 위로 치솟는 것을 막아줍니다.
+    [핵심 알고리즘] 픽셀 투영(Projection)을 이용한 정밀 절단
+    두 박스가 겹치거나 붙어있으면, 그 사이에서 '픽셀이 가장 적은 라인(Gap)'을 찾아 자릅니다.
     """
     if not regions: return []
     
-    # 그레이스케일 변환 및 이진화 (글자는 검정, 배경은 흰색 가정 또는 반대)
-    # OCR 정확도를 위해 Otsu 이진화를 사용해 글자 영역을 확실히 찾습니다.
-    if len(image.shape) == 3:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = image
-        
-    # 글자가 어두운 색이라고 가정하고 이진화 (배경이 밝음)
-    # 인포그래픽 특성상 글자가 밝을 수도 있으므로, 박스 내부의 분산 등을 볼 수 있지만
-    # 여기서는 일반적인 adaptive thresholding을 사용합니다.
-    binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
+    # 1. 이미지 이진화 (글자는 1, 배경은 0)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+    # 글자가 어두운 경우와 밝은 경우 모두 대비를 극대화
+    binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 15, 10)
     
-    for r in regions:
-        x, y = r.bounds['x'], r.bounds['y']
-        w, h = r.bounds['width'], r.bounds['height']
-        
-        # 이미지 범위를 벗어나지 않게 클핑
-        x = max(0, x); y = max(0, y)
-        w = min(w, image.shape[1] - x); h = min(h, image.shape[0] - y)
-        
-        if w <= 0 or h <= 0: continue
-        
-        # 해당 영역(ROI) 추출
-        roi = binary[y:y+h, x:x+w]
-        
-        # 수평 투영 (Horizontal Projection): 각 행(row)의 픽셀 합을 구함
-        # 글자가 있는 행은 값이 크고, 빈 공간은 0에 가까움
-        row_sum = cv2.reduce(roi, 1, cv2.REDUCE_SUM, dtype=cv2.CV_32F).flatten()
-        
-        # 픽셀이 있는 첫 번째 행(Top)과 마지막 행(Bottom) 찾기
-        non_zero_indices = np.where(row_sum > (w * 0.05 * 255)) # 노이즈(5%) 제외하고 글자 픽셀 찾기
-        
-        if len(non_zero_indices[0]) > 0:
-            top_offset = non_zero_indices[0][0]
-            bottom_offset = non_zero_indices[0][-1]
-            
-            # 실제 글자 높이
-            new_h = bottom_offset - top_offset + 1
-            
-            # 너무 작아지면(노이즈만 잡은 경우) 무시하고, 의미 있게 줄어들면 적용
-            if new_h > 5 and new_h < h:
-                # 좌표 업데이트 (Top은 아래로 내려가고, Height는 줄어듦)
-                r.bounds['y'] = y + top_offset
-                r.bounds['height'] = new_h
-                
-                # 디버깅용: "조여졌다"는 것을 알 수 있음
-                # print(f"Region {r.id} tightened: y {y}->{r.bounds['y']}, h {h}->{new_h}")
-                
-    return regions
-
-def prevent_vertical_overlaps(regions: List[TextRegion], buffer: int = 5) -> List[TextRegion]:
-    """
-    [강력한 행간 분리] 
-    픽셀 축소 후에도 겹치는 박스가 있다면, '빈 공백'을 기준으로 강제 분할합니다.
-    """
-    if not regions: return []
+    # Y좌표 순 정렬
     regions.sort(key=lambda r: r.bounds['y'])
     
-    for i in range(len(regions)):
-        for j in range(i + 1, len(regions)):
-            upper = regions[i]
-            lower = regions[j]
+    # 개별 박스 최적화 (위아래 빈 공간 트리밍)
+    for r in regions:
+        x, y, w, h = r.bounds['x'], r.bounds['y'], r.bounds['width'], r.bounds['height']
+        roi = binary[max(0, y):min(binary.shape[0], y+h), max(0, x):min(binary.shape[1], x+w)]
+        if roi.size == 0: continue
+        
+        # 행별 픽셀 합계
+        row_sums = np.sum(roi, axis=1)
+        non_empty_rows = np.where(row_sums > (w * 255 * 0.02))[0] # 2% 이상 픽셀이 있는 곳만 인정
+        
+        if len(non_empty_rows) > 0:
+            top_trim = non_empty_rows[0]
+            bottom_trim = non_empty_rows[-1]
+            # 좌표 갱신 (빈 공간 제거)
+            r.bounds['y'] = y + top_trim
+            r.bounds['height'] = bottom_trim - top_trim + 1
             
-            if lower.bounds['y'] > (upper.bounds['y'] + upper.bounds['height'] + 10):
-                continue
+    # [중요] 박스 간 충돌 해결 (Split Line 찾기)
+    for i in range(len(regions) - 1):
+        upper = regions[i]
+        lower = regions[i+1]
+        
+        # 수직으로 겹치거나 너무 가까운 경우 (5px 이내)
+        u_bottom = upper.bounds['y'] + upper.bounds['height']
+        l_top = lower.bounds['y']
+        
+        if u_bottom >= l_top - 5:
+            # 두 박스 사이의 탐색 범위 설정 (윗박스 중간 ~ 아랫박스 중간)
+            search_y_start = upper.bounds['y'] + upper.bounds['height'] // 2
+            search_y_end = lower.bounds['y'] + lower.bounds['height'] // 2
+            
+            # X축 공통 범위 (겹치는 가로 구간)
+            x_start = max(upper.bounds['x'], lower.bounds['x'])
+            x_end = min(upper.bounds['x'] + upper.bounds['width'], lower.bounds['x'] + lower.bounds['width'])
+            
+            # 가로로 겹치지 않으면 패스
+            if x_end <= x_start: continue
+            
+            # 탐색 범위 내에서 픽셀 투영
+            search_roi = binary[search_y_start:search_y_end, x_start:x_end]
+            if search_roi.size == 0: continue
+            
+            row_sums = np.sum(search_roi, axis=1)
+            
+            # 픽셀 합이 가장 작은(최소값) 행 찾기 -> 여기가 빈 공간(Gap)임!
+            min_indices = np.where(row_sums == row_sums.min())[0]
+            split_line_local = min_indices[len(min_indices)//2] # 여러 개면 중간값 선택
+            
+            split_line_global = search_y_start + split_line_local
+            
+            # 강제 분할 적용
+            # 윗 박스는 분할선 위에서 끝남
+            upper.bounds['height'] = max(10, split_line_global - upper.bounds['y'] - 2)
+            
+            # 아랫 박스는 분할선 아래서 시작
+            old_bottom = lower.bounds['y'] + lower.bounds['height']
+            lower.bounds['y'] = split_line_global + 2
+            lower.bounds['height'] = max(10, old_bottom - lower.bounds['y'])
 
-            u_left, u_right = upper.bounds['x'], upper.bounds['x'] + upper.bounds['width']
-            l_left, l_right = lower.bounds['x'], lower.bounds['x'] + lower.bounds['width']
-            
-            intersect_x1 = max(u_left, l_left)
-            intersect_x2 = min(u_right, l_right)
-            
-            # 가로로 겹치는 구간이 있다면 (같은 컬럼)
-            if intersect_x2 > intersect_x1:
-                u_bottom = upper.bounds['y'] + upper.bounds['height']
-                l_top = lower.bounds['y']
-                
-                # 세로로 겹친다면
-                if u_bottom >= l_top:
-                    # 겹치는 구간의 중간 지점을 찾음
-                    mid_y = (u_bottom + l_top) // 2
-                    
-                    # 윗 박스는 중간 지점보다 조금 위에서 끝내고
-                    upper.bounds['height'] = max(10, (mid_y - buffer) - upper.bounds['y'])
-                    
-                    # 아랫 박스는 중간 지점보다 조금 아래에서 시작 (Top 이동, 높이 축소)
-                    original_bottom = lower.bounds['y'] + lower.bounds['height']
-                    new_top = mid_y + buffer
-                    lower.bounds['y'] = new_top
-                    lower.bounds['height'] = max(10, original_bottom - new_top)
-
+    # ID 재할당
     for i, r in enumerate(regions):
         prefix = "inv" if r.is_inverted else "ocr"
         r.id = f"{prefix}_{i:03d}"
@@ -268,14 +245,11 @@ def run_enhanced_ocr(image: np.ndarray) -> Dict:
     
     all_raw_regions = normal_regions + inverted_regions
     
-    # 1. 행 단위 합치기
+    # 1. 9줄로 합치기
     merged_regions = merge_regions_by_row(all_raw_regions)
     
-    # 2. [NEW] 픽셀 기반 박스 축소 (Tightening) - 여기서 공백을 확보합니다.
-    tightened_regions = optimize_vertical_bounds(image, merged_regions)
-    
-    # 3. [UPDATED] 그래도 겹치면 강제 분리
-    final_regions = prevent_vertical_overlaps(tightened_regions)
+    # 2. [NEW] 픽셀 투영 분석으로 정밀 절단 (겹침 원천 봉쇄)
+    final_regions = refine_vertical_boundaries_by_projection(image, merged_regions)
     
     final_normal = [r for r in final_regions if not r.is_inverted]
     final_inverted = [r for r in final_regions if r.is_inverted]
