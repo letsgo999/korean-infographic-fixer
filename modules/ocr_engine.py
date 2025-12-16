@@ -28,7 +28,7 @@ class TextRegion:
     
     font_family: str = "Noto Sans KR"
     font_filename: str = None
-    width_scale: int = 80
+    width_scale: int = 90
     
     font_weight: str = "Regular"
     is_manual: bool = False
@@ -366,5 +366,5 @@ def create_manual_region(x: int, y: int, width: int, height: int, text: str, sty
         is_manual=True,
         style_tag=style_tag,
         suggested_font_size=14,
-        width_scale=80
+        width_scale=90
     )
