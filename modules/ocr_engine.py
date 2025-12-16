@@ -1,6 +1,6 @@
 """
 OCR Engine Module
-텍스트 추출 및 좌표 인식을 담당하는 핵심 모듈 (Column Separation & Force Trim Version)
+텍스트 추출 및 좌표 인식을 담당하는 핵심 모듈 (Row Force Merge - Rollback Version)
 """
 import cv2
 import numpy as np
@@ -43,6 +43,7 @@ class OCREngine:
             image_rgb = image
             
         pil_image = Image.fromarray(image_rgb)
+        # PSM 6: 단일 블록으로 가정하여 파편화 방지
         custom_config = r'--oem 3 --psm 6'
         
         try:
@@ -58,6 +59,8 @@ class OCREngine:
         for i in range(n_boxes):
             text = ocr_data['text'][i].strip()
             conf = int(ocr_data['conf'][i])
+            
+            # 노이즈 필터 적용
             if conf >= self.min_confidence and is_valid_text(text):
                 region = TextRegion(
                     id=f"raw_{len(regions)}",
@@ -148,6 +151,7 @@ class InvertedRegionDetector:
         return regions
 
 def is_valid_text(text: str) -> bool:
+    """노이즈 필터: 특수문자만 있거나, 의미 없는 1글자 영문 등 제거"""
     t = text.strip()
     if not t: return False
     if not re.search(r'[가-힣a-zA-Z0-9]', t): return False
@@ -156,136 +160,68 @@ def is_valid_text(text: str) -> bool:
 
 def merge_regions_by_row(regions: List[TextRegion]) -> List[TextRegion]:
     """
-    [핵심 수정] 
-    1. 행 단위로 묶되
-    2. 글자 사이의 간격(Gap)이 너무 크면(그래픽 영역으로 넘어가는 경우) 끊어버립니다.
+    [복구된 핵심 기능]
+    Y좌표가 비슷하면 거리나 내용에 상관없이 무조건 하나의 행으로 강제 병합합니다.
+    (9줄 인식 성공 버전)
     """
     if not regions:
         return []
-    
-    # Y 좌표 순 정렬
+        
     regions.sort(key=lambda r: r.bounds['y'])
-    
     merged_rows = []
     
     while regions:
         current = regions.pop(0)
         current_cy = current.bounds['y'] + current.bounds['height'] // 2
         
-        # 1. 같은 행 후보 찾기
-        row_candidates = [current]
+        row_group = [current]
         others = []
         
         for r in regions:
             r_cy = r.bounds['y'] + r.bounds['height'] // 2
             height_ref = max(current.bounds['height'], r.bounds['height'])
             
-            # 높이 차이가 크지 않으면 같은 행
+            # 높이 차이가 크지 않으면 무조건 같은 줄로 간주
             if abs(current_cy - r_cy) < (height_ref * 0.5):
-                row_candidates.append(r)
+                row_group.append(r)
             else:
                 others.append(r)
-        
+                
         regions = others
         
-        # 2. X 좌표 순 정렬 (좌 -> 우)
-        row_candidates.sort(key=lambda r: r.bounds['x'])
+        # 합치기
+        row_group.sort(key=lambda r: r.bounds['x'])
         
-        # 3. [Gap Check] 간격이 너무 넓으면 그룹 분리
-        groups_in_row = []
-        current_group = [row_candidates[0]]
+        min_x = min(r.bounds['x'] for r in row_group)
+        min_y = min(r.bounds['y'] for r in row_group)
+        max_x = max(r.bounds['x'] + r.bounds['width'] for r in row_group)
+        max_y = max(r.bounds['y'] + r.bounds['height'] for r in row_group)
         
-        for i in range(1, len(row_candidates)):
-            prev = row_candidates[i-1]
-            curr = row_candidates[i]
-            
-            prev_right = prev.bounds['x'] + prev.bounds['width']
-            curr_left = curr.bounds['x']
-            gap = curr_left - prev_right
-            
-            # 허용 간격: 글자 높이의 2.5배 (이보다 멀면 다른 덩어리)
-            max_gap = max(prev.bounds['height'], curr.bounds['height']) * 2.5
-            
-            if gap > max_gap:
-                groups_in_row.append(current_group) # 그룹 마감
-                current_group = [curr]              # 새 그룹 시작
-            else:
-                current_group.append(curr)
+        # 텍스트 단순 연결 (공백 포함)
+        full_text = " ".join([r.text for r in row_group])
+        avg_conf = sum(r.confidence for r in row_group) / len(row_group)
         
-        groups_in_row.append(current_group)
+        new_region = TextRegion(
+            id="merged",
+            text=full_text,
+            confidence=avg_conf,
+            bounds={'x': min_x, 'y': min_y, 'width': max_x - min_x, 'height': max_y - min_y},
+            is_inverted=row_group[0].is_inverted
+        )
+        merged_rows.append(new_region)
         
-        # 4. 각 그룹을 하나의 박스로 합치기
-        for group in groups_in_row:
-            min_x = min(r.bounds['x'] for r in group)
-            min_y = min(r.bounds['y'] for r in group)
-            max_x = max(r.bounds['x'] + r.bounds['width'] for r in group)
-            max_y = max(r.bounds['y'] + r.bounds['height'] for r in group)
-            
-            # 텍스트 합치기
-            full_text = " ".join([r.text for r in group])
-            avg_conf = sum(r.confidence for r in group) / len(group)
-            
-            new_region = TextRegion(
-                id="merged",
-                text=full_text,
-                confidence=avg_conf,
-                bounds={'x': min_x, 'y': min_y, 'width': max_x - min_x, 'height': max_y - min_y},
-                is_inverted=group[0].is_inverted
-            )
-            merged_rows.append(new_region)
-
-    return merged_rows
-
-def force_trim_to_text_column(regions: List[TextRegion]) -> List[TextRegion]:
-    """
-    [신규 기능] 텍스트 컬럼의 우측 한계선을 계산하여 강제 절삭
-    """
-    if not regions:
-        return []
-
-    # 1. 우측 한계선(Column Limit) 계산
-    # 모든 박스의 우측 끝 좌표(x2)를 수집
-    right_edges = [(r.bounds['x'] + r.bounds['width']) for r in regions]
-    
-    # 상위 20% 지점을 '유효 텍스트 경계'로 간주 (너무 긴 튀는 값 제외)
-    # 예: 대부분 텍스트가 500px에서 끝나는데 하나만 800px라면 500px 근처로 잡음
-    right_edges.sort()
-    limit_index = int(len(right_edges) * 0.85) # 85% 지점
-    column_limit_x = right_edges[limit_index]
-    
-    # 약간의 여유(Padding)
-    column_limit_x += 20 
-    
-    trimmed_regions = []
-    for r in regions:
-        r_right = r.bounds['x'] + r.bounds['width']
-        
-        # 박스가 한계선을 심하게 넘어가면 잘라버림
-        if r.bounds['x'] < column_limit_x and r_right > column_limit_x:
-            new_width = column_limit_x - r.bounds['x']
-            
-            # 너무 짧아지면(의미 없으면) 스킵, 아니면 수정
-            if new_width > 20:
-                r.bounds['width'] = int(new_width)
-                trimmed_regions.append(r)
-        # 아예 한계선 밖에 있는 박스(100% 노이즈)는 제거
-        elif r.bounds['x'] >= column_limit_x:
-            continue
-        else:
-            trimmed_regions.append(r)
-            
-    # 정렬 및 ID 재할당
-    trimmed_regions.sort(key=lambda r: (r.bounds['y'], r.bounds['x']))
-    for i, r in enumerate(trimmed_regions):
+    merged_rows.sort(key=lambda r: (r.bounds['y'], r.bounds['x']))
+    for i, r in enumerate(merged_rows):
         prefix = "inv" if r.is_inverted else "ocr"
         r.id = f"{prefix}_{i:03d}"
         
-    return trimmed_regions
+    return merged_rows
 
 def run_enhanced_ocr(image: np.ndarray) -> Dict:
     ocr_engine = OCREngine()
     inv_detector = InvertedRegionDetector()
     
+    # 1. 추출
     normal_regions = ocr_engine.extract_text_regions(image)
     dark_regions = inv_detector.detect(image)
     inverted_regions = []
@@ -295,11 +231,8 @@ def run_enhanced_ocr(image: np.ndarray) -> Dict:
     
     all_raw_regions = normal_regions + inverted_regions
     
-    # 1. 행 단위 통합 (Gap이 크면 분리)
-    merged_regions = merge_regions_by_row(all_raw_regions)
-    
-    # 2. [NEW] 우측 강제 절삭 (그래픽 영역 침범 방지)
-    final_regions = force_trim_to_text_column(merged_regions)
+    # 2. 행 단위 강제 통합 (이전의 성공적인 로직)
+    final_regions = merge_regions_by_row(all_raw_regions)
     
     final_normal = [r for r in final_regions if not r.is_inverted]
     final_inverted = [r for r in final_regions if r.is_inverted]
