@@ -1,15 +1,15 @@
 """
 OCR Engine Module
-[v7 - 공백 3칸 + 픽셀 밀도 체크] 
-1. 행 병합 유지
-2. 공백 3칸 이상 → 무조건 끊음
-3. 공백 2~3칸 → 다음 영역 픽셀 밀도로 텍스트/그림 구분
+[v8 - 병합 조건 강화] 
+1. X축 간격이 3칸 이상이면 같은 행이어도 병합 안함
+2. 수평 확장 로직 제거 (필요 없음)
+3. 단순하고 정확한 영역 지정
 """
 import cv2
 import numpy as np
 from PIL import Image
 import pytesseract
-from typing import List, Dict, Tuple
+from typing import List, Dict
 from dataclasses import dataclass, asdict
 import re
 
@@ -139,8 +139,14 @@ def is_valid_text(text: str) -> bool:
     return True
 
 
-def merge_regions_by_row(regions: List[TextRegion]) -> List[TextRegion]:
-    """행 단위 병합"""
+def merge_regions_by_row_strict(regions: List[TextRegion]) -> List[TextRegion]:
+    """
+    [v8 핵심] 행 단위 병합 - X축 간격 조건 추가
+    
+    병합 조건:
+    1. 같은 Y축 라인 (기존)
+    2. X축 간격이 3칸 미만 (신규)
+    """
     if not regions: return []
     regions.sort(key=lambda r: r.bounds['y'])
     merged_rows = []
@@ -148,36 +154,68 @@ def merge_regions_by_row(regions: List[TextRegion]) -> List[TextRegion]:
     while regions:
         current = regions.pop(0)
         current_cy = current.bounds['y'] + current.bounds['height'] // 2
-        row_group = [current]
+        current_h = current.bounds['height']
+        
+        # 3칸 공백 기준 (글자 너비 ≈ 높이)
+        max_gap = current_h * 2.5
+        
+        row_candidates = []
         others = []
         
+        # 같은 Y축 라인의 영역들 수집
         for r in regions:
             r_cy = r.bounds['y'] + r.bounds['height'] // 2
-            height_ref = max(current.bounds['height'], r.bounds['height'])
+            height_ref = max(current_h, r.bounds['height'])
             if abs(current_cy - r_cy) < (height_ref * 0.5):
-                row_group.append(r)
+                row_candidates.append(r)
             else:
                 others.append(r)
         
         regions = others
-        row_group.sort(key=lambda r: r.bounds['x'])
         
-        min_x = min(r.bounds['x'] for r in row_group)
-        min_y = min(r.bounds['y'] for r in row_group)
-        max_x = max(r.bounds['x'] + r.bounds['width'] for r in row_group)
-        max_y = max(r.bounds['y'] + r.bounds['height'] for r in row_group)
+        # X축 순서로 정렬
+        row_candidates.sort(key=lambda r: r.bounds['x'])
         
-        full_text = " ".join([r.text for r in row_group])
-        avg_conf = sum(r.confidence for r in row_group) / len(row_group)
+        # 현재 그룹 (current부터 시작)
+        current_group = [current]
+        
+        # X축 간격 조건으로 연속된 것만 병합
+        for candidate in row_candidates:
+            last_in_group = current_group[-1]
+            last_right = last_in_group.bounds['x'] + last_in_group.bounds['width']
+            candidate_left = candidate.bounds['x']
+            
+            gap = candidate_left - last_right
+            
+            if gap < max_gap:
+                # 간격이 작으면 같은 그룹
+                current_group.append(candidate)
+            else:
+                # 간격이 크면 별도 영역으로 분리 → 나중에 처리
+                regions.append(candidate)
+        
+        # 그룹을 하나의 영역으로 병합
+        current_group.sort(key=lambda r: r.bounds['x'])
+        
+        min_x = min(r.bounds['x'] for r in current_group)
+        min_y = min(r.bounds['y'] for r in current_group)
+        max_x = max(r.bounds['x'] + r.bounds['width'] for r in current_group)
+        max_y = max(r.bounds['y'] + r.bounds['height'] for r in current_group)
+        
+        full_text = " ".join([r.text for r in current_group])
+        avg_conf = sum(r.confidence for r in current_group) / len(current_group)
         
         new_region = TextRegion(
             id="merged",
             text=full_text,
             confidence=avg_conf,
             bounds={'x': min_x, 'y': min_y, 'width': max_x - min_x, 'height': max_y - min_y},
-            is_inverted=row_group[0].is_inverted
+            is_inverted=current_group[0].is_inverted
         )
         merged_rows.append(new_region)
+        
+        # 남은 regions 다시 정렬
+        regions.sort(key=lambda r: r.bounds['y'])
     
     return merged_rows
 
@@ -242,144 +280,6 @@ def refine_vertical_boundaries_by_projection(image: np.ndarray, regions: List[Te
     return regions
 
 
-def calc_pixel_density(binary: np.ndarray, x: int, y: int, w: int, h: int) -> float:
-    """영역의 픽셀 밀도 계산 (0.0 ~ 1.0)"""
-    if w <= 0 or h <= 0:
-        return 0.0
-    
-    roi = binary[y:y+h, x:x+w]
-    if roi.size == 0:
-        return 0.0
-    
-    return np.sum(roi > 0) / roi.size
-
-
-def is_text_like_region(binary: np.ndarray, x: int, y: int, w: int, h: int) -> bool:
-    """
-    해당 영역이 텍스트처럼 생겼는지 판단
-    
-    텍스트 특징:
-    - 픽셀 밀도가 높음 (글자가 빽빽함)
-    - 수평 방향으로 연속적임
-    
-    그림 특징:
-    - 픽셀 밀도가 낮음 (선만 있거나 산발적)
-    - 불규칙한 패턴
-    """
-    if w <= 0 or h <= 0:
-        return False
-    
-    roi = binary[y:y+h, x:x+w]
-    if roi.size == 0:
-        return False
-    
-    # 1. 전체 픽셀 밀도
-    density = np.sum(roi > 0) / roi.size
-    
-    # 텍스트는 보통 밀도가 0.15 이상
-    # 그림 경계선은 0.05~0.10 정도
-    if density < 0.12:
-        return False
-    
-    # 2. 수평 연속성 체크: 각 행에 픽셀이 고르게 분포하는지
-    row_sums = np.sum(roi, axis=1)
-    non_empty_rows = np.sum(row_sums > 0)
-    row_fill_ratio = non_empty_rows / h if h > 0 else 0
-    
-    # 텍스트는 행의 70% 이상에 픽셀이 있음
-    if row_fill_ratio < 0.5:
-        return False
-    
-    return True
-
-
-def find_text_end_by_gap(binary: np.ndarray, region: TextRegion) -> int:
-    """
-    [핵심 함수] 텍스트가 끝나는 지점 찾기
-    
-    로직:
-    - 3칸 이상 공백 → 무조건 끊음
-    - 2~3칸 공백 후 내용 → 밀도 체크로 텍스트/그림 구분
-    """
-    img_h, img_w = binary.shape
-    
-    text_h = region.bounds['height']
-    x_start = region.bounds['x']
-    x_end = region.bounds['x'] + region.bounds['width']
-    y1 = max(0, region.bounds['y'])
-    y2 = min(img_h, region.bounds['y'] + text_h)
-    
-    # 공백 기준 (글자 너비 ≈ 텍스트 높이)
-    char_width = text_h
-    gap_2_chars = int(char_width * 1.8)   # 2칸 공백
-    gap_3_chars = int(char_width * 2.7)   # 3칸 공백
-    
-    roi = binary[y1:y2, x_start:x_end]
-    if roi.size == 0:
-        return x_end
-    
-    col_sums = np.sum(roi, axis=0)
-    
-    last_content_x = x_start
-    gap_start = -1
-    
-    for i, col_sum in enumerate(col_sums):
-        abs_x = x_start + i
-        
-        if col_sum > 0:
-            # 내용 있음
-            if gap_start != -1:
-                gap_width = abs_x - gap_start
-                
-                # 3칸 이상 공백 → 무조건 끊음
-                if gap_width >= gap_3_chars:
-                    return gap_start
-                
-                # 2~3칸 공백 → 다음 영역이 텍스트인지 그림인지 확인
-                if gap_width >= gap_2_chars:
-                    # 공백 이후 영역 (1글자 너비만큼) 체크
-                    check_width = min(int(char_width * 1.5), x_end - abs_x)
-                    if check_width > 5:
-                        if not is_text_like_region(binary, abs_x, y1, check_width, y2 - y1):
-                            # 그림으로 판단 → 끊음
-                            return gap_start
-                        # 텍스트로 판단 → 계속 진행
-            
-            last_content_x = abs_x
-            gap_start = -1
-        else:
-            if gap_start == -1:
-                gap_start = abs_x
-    
-    # 마지막 공백 체크
-    if gap_start != -1:
-        gap_width = x_end - gap_start
-        if gap_width >= gap_2_chars:
-            return gap_start
-    
-    return min(last_content_x + int(char_width * 0.3), x_end)
-
-
-def trim_horizontal_bounds(image: np.ndarray, regions: List[TextRegion]) -> List[TextRegion]:
-    """각 행의 오른쪽 경계를 트리밍"""
-    if not regions:
-        return []
-    
-    binary = get_content_mask(image)
-    
-    for r in regions:
-        if r.is_inverted:
-            continue
-        
-        right_x = find_text_end_by_gap(binary, r)
-        new_width = right_x - r.bounds['x']
-        
-        if new_width > 10:
-            r.bounds['width'] = new_width
-    
-    return regions
-
-
 def run_enhanced_ocr(image: np.ndarray) -> Dict:
     """메인 OCR 함수"""
     ocr_engine = OCREngine()
@@ -394,9 +294,12 @@ def run_enhanced_ocr(image: np.ndarray) -> Dict:
         inverted_regions.extend(inv_texts)
     
     all_raw_regions = normal_regions + inverted_regions
-    merged_regions = merge_regions_by_row(all_raw_regions)
-    vertical_refined = refine_vertical_boundaries_by_projection(image, merged_regions)
-    final_regions = trim_horizontal_bounds(image, vertical_refined)
+    
+    # [v8 핵심] X축 간격 조건이 추가된 병합
+    merged_regions = merge_regions_by_row_strict(all_raw_regions)
+    
+    # 수직 경계 정제
+    final_regions = refine_vertical_boundaries_by_projection(image, merged_regions)
     
     final_normal = [r for r in final_regions if not r.is_inverted]
     final_inverted = [r for r in final_regions if r.is_inverted]
