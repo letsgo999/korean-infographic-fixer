@@ -1,8 +1,9 @@
 """
 OCR Engine Module
-[v10.1 - 공백 3.5칸 기준] 
+[v11 - 빈 열 카운트 방식] 
 1. 행 병합 기본 유지
-2. 수평 트리밍: 3.5칸 이상 공백에서 끊음
+2. 수평 트리밍: "완전히 빈 열(col_sum == 0)"이 2칸 연속되면 끊음
+3. 그림 픽셀이 띄엄띄엄 있어도 빈 열 연속 카운트에 영향 없음
 """
 import cv2
 import numpy as np
@@ -241,10 +242,18 @@ def refine_vertical_boundaries_by_projection(image: np.ndarray, regions: List[Te
     return regions
 
 
-def find_text_end_by_gap(image: np.ndarray, region: TextRegion) -> int:
+def find_text_end_by_empty_columns(image: np.ndarray, region: TextRegion) -> int:
     """
-    텍스트가 끝나는 지점 찾기
-    3.5칸 이상 공백이 연속되면 거기서 끊음
+    [v11 핵심] 완전히 빈 열 카운트 방식
+    
+    원리:
+    - col_sum == 0인 열만 "진짜 빈 열"로 카운트
+    - 진짜 빈 열이 2칸(text_h * 1.5) 연속되면 끊음
+    - 그림 픽셀이 중간에 있으면 빈 열 카운트 리셋 안 됨 (그냥 무시)
+    
+    v6과의 차이:
+    - v6: 공백 시작 → 내용 나오면 공백 너비 계산 → 큰 공백이면 끊음
+    - v11: 빈 열 연속 카운트 → 임계값 도달하면 끊음
     """
     binary = get_content_mask(image)
     img_h, img_w = binary.shape
@@ -255,8 +264,8 @@ def find_text_end_by_gap(image: np.ndarray, region: TextRegion) -> int:
     y1 = max(0, region.bounds['y'])
     y2 = min(img_h, region.bounds['y'] + text_h)
     
-    # [v10.1] 3.5칸 공백 기준
-    gap_threshold = int(text_h * 3.5)
+    # 2칸 공백 기준 (글자 너비 ≈ 텍스트 높이)
+    empty_threshold = int(text_h * 1.5)
     
     roi = binary[y1:y2, x_start:x_end]
     if roi.size == 0:
@@ -265,33 +274,37 @@ def find_text_end_by_gap(image: np.ndarray, region: TextRegion) -> int:
     col_sums = np.sum(roi, axis=0)
     
     last_content_x = x_start
-    gap_start = -1
+    empty_col_count = 0
+    empty_start_x = -1
     
     for i, col_sum in enumerate(col_sums):
         abs_x = x_start + i
         
-        if col_sum > 0:
-            if gap_start != -1:
-                gap_width = abs_x - gap_start
-                if gap_width >= gap_threshold:
-                    return gap_start
+        if col_sum == 0:
+            # 완전히 빈 열
+            if empty_start_x == -1:
+                empty_start_x = abs_x
+            empty_col_count += 1
             
-            last_content_x = abs_x
-            gap_start = -1
+            # 빈 열이 임계값 이상 연속되면 끊음
+            if empty_col_count >= empty_threshold:
+                return empty_start_x
         else:
-            if gap_start == -1:
-                gap_start = abs_x
+            # 내용 있는 열
+            last_content_x = abs_x
+            empty_col_count = 0
+            empty_start_x = -1
     
-    if gap_start != -1:
-        gap_width = x_end - gap_start
-        if gap_width >= gap_threshold:
-            return gap_start
+    # 마지막까지 빈 열이 연속된 경우
+    if empty_col_count >= empty_threshold and empty_start_x != -1:
+        return empty_start_x
     
+    # 끊을 곳 없으면 마지막 내용 위치 + 여유
     return min(last_content_x + int(text_h * 0.3), x_end)
 
 
 def trim_horizontal_bounds(image: np.ndarray, regions: List[TextRegion]) -> List[TextRegion]:
-    """각 행의 오른쪽 경계를 공백 기준으로 트리밍"""
+    """각 행의 오른쪽 경계를 빈 열 기준으로 트리밍"""
     if not regions:
         return []
     
@@ -299,7 +312,7 @@ def trim_horizontal_bounds(image: np.ndarray, regions: List[TextRegion]) -> List
         if r.is_inverted:
             continue
         
-        right_x = find_text_end_by_gap(image, r)
+        right_x = find_text_end_by_empty_columns(image, r)
         new_width = right_x - r.bounds['x']
         
         if new_width > 10:
@@ -324,6 +337,8 @@ def run_enhanced_ocr(image: np.ndarray) -> Dict:
     all_raw_regions = normal_regions + inverted_regions
     merged_regions = merge_regions_by_row(all_raw_regions)
     vertical_refined = refine_vertical_boundaries_by_projection(image, merged_regions)
+    
+    # [v11] 빈 열 카운트 방식으로 트리밍
     final_regions = trim_horizontal_bounds(image, vertical_refined)
     
     final_normal = [r for r in final_regions if not r.is_inverted]
