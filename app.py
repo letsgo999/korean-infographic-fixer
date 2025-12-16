@@ -170,8 +170,8 @@ def render_step2_detect():
                             region.id = f"manual_{i:03d}"
                             
                             # 기본 스타일 설정 (이전 대화에서 정한 값)
-                            region.suggested_font_size = 14
-                            region.width_scale = 80
+                            region.suggested_font_size = 16
+                            region.width_scale = 90
                             
                             regions.append(region.to_dict())
                         
