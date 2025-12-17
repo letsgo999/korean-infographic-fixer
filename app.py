@@ -39,9 +39,9 @@ def init_session_state():
     if 'canvas_key' not in st.session_state:
         st.session_state.canvas_key = "canvas_v1"
 
-def process_image_for_display(image_array, max_width=800):
+def process_image_for_display(image_array, max_width=600): # [변경] 800 -> 600 (전송률 향상)
     """
-    이미지 리사이징 함수 (캐시 제거됨 - 배경 이미지 오류 해결)
+    이미지 리사이징 및 포맷 정규화
     """
     h_orig, w_orig = image_array.shape[:2]
     scale_factor = 1.0
@@ -63,7 +63,8 @@ def process_image_for_display(image_array, max_width=800):
     else:
         img_rgb = display_img_cv
         
-    pil_image = Image.fromarray(img_rgb)
+    # [중요] RGB 모드로 강제 변환 (호환성 확보)
+    pil_image = Image.fromarray(img_rgb).convert("RGB")
     
     return pil_image, scale_factor, new_width, new_height
 
@@ -85,7 +86,7 @@ def draw_regions_on_image(image, regions, edited_texts):
         x, y, w, h = bounds['x'], bounds['y'], bounds['width'], bounds['height']
         
         if r_id in edited_texts and edited_texts[r_id] != text:
-            color = (255, 0, 255) # Magenta
+            color = (255, 0, 255) 
             thickness = 3
         elif is_inverted:
             color = (255, 100, 0) 
@@ -118,7 +119,7 @@ def render_step1_upload():
             st.rerun()
 
 def render_step2_detect():
-    """Step 2: 수동 영역 지정 (이미지 표시 오류 수정)"""
+    """Step 2: 수동 영역 지정 (안전장치 추가됨)"""
     st.header("Step 2: 텍스트 영역 지정")
     
     if st.session_state.original_image is None:
@@ -127,17 +128,18 @@ def render_step2_detect():
 
     original_image = st.session_state.original_image
     
-    # 이미지 처리 (캐시 없이 직접 호출)
     try:
         pil_image, scale_factor, new_width, new_height = process_image_for_display(original_image)
-        # 캡션으로 해상도 확인
-        st.caption(f"ℹ️ 편집 해상도: {new_width}x{new_height} (원본 비율: {scale_factor:.2f})")
     except Exception as e:
         st.error(f"이미지 처리 중 오류 발생: {e}")
         return
 
-    st.info(f"🖱️ 마우스로 수정할 텍스트 영역을 박스로 그려주세요.")
+    st.info(f"🖱️ 아래 이미지 위에 마우스로 박스를 그려주세요.")
 
+    # [안전장치 1] 참조 이미지 표시 (캔버스 배경이 안 나올 경우를 대비)
+    st.caption("👇 작업할 이미지 (배경이 안 보이면 '캔버스 초기화'를 눌러주세요)")
+    
+    # [안전장치 2] 캔버스 초기화 버튼
     col_reset, _ = st.columns([1, 4])
     with col_reset:
         if st.button("🔄 캔버스 초기화"):
@@ -150,7 +152,7 @@ def render_step2_detect():
             fill_color="rgba(255, 165, 0, 0.2)",
             stroke_width=2,
             stroke_color="#FF0000",
-            background_image=pil_image, # 여기서 PIL 이미지가 직접 들어감
+            background_image=pil_image, # 여기서 PIL 이미지가 들어감
             update_streamlit=True,
             height=new_height,
             width=new_width,
@@ -161,6 +163,10 @@ def render_step2_detect():
     except Exception as e:
         st.error(f"캔버스 컴포넌트 로딩 실패: {e}")
         st.stop()
+    
+    # 캔버스 바로 아래에 디버깅용 이미지 표시 (혹시 캔버스가 비어도 이건 보여야 함)
+    if canvas_result.json_data is None:
+        st.image(pil_image, caption="이미지 로딩 확인용", width=new_width)
 
     if canvas_result.json_data is not None:
         objects = canvas_result.json_data["objects"]
@@ -191,7 +197,7 @@ def render_step2_detect():
                         region = extract_text_from_crop(original_image, x, y, w, h)
                         region.id = f"manual_{i:03d}"
                         
-                        # [기본값 적용: 16px, 90%, Black]
+                        # [기본값 적용]
                         region.suggested_font_size = 16
                         region.width_scale = 90
                         region.font_filename = "NotoSansKR-Black.ttf"
@@ -241,7 +247,6 @@ def render_step3_edit():
                 with c1:
                     curr_font = region.get('font_filename', available_fonts[0])
                     if curr_font not in available_fonts: curr_font = available_fonts[0]
-                    # 기본 폰트가 목록에 없으면 첫번째꺼 선택
                     try:
                         idx = available_fonts.index(curr_font)
                     except ValueError:
