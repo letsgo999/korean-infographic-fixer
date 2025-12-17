@@ -2,18 +2,18 @@
 # Streamlit Cloud Compatible Version
 
 # Web Framework
-streamlit==1.40.0
+streamlit==1.52.1
 
 # Mouse Drag Text Area Select
-streamlit-drawable-canvas==0.9.3
+streamlit-drawable-canvas==0.9.5
 
 # Image Processing
-opencv-python-headless>=4.8.0
-Pillow>=10.0.0
-numpy>=1.24.0
+opencv-python-headless
+numpy
+pillow
 
 # OCR
-pytesseract>=0.3.10
+pytesseract
 
 # Data Processing
 scikit-learn>=1.3.0
