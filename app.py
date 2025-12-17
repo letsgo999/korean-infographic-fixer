@@ -38,35 +38,9 @@ def init_session_state():
         st.session_state.edited_texts = {}
     if 'canvas_key' not in st.session_state:
         st.session_state.canvas_key = "canvas_v1"
-
-def process_image_for_display(image_array, max_width=600): # [변경] 800 -> 600 (전송률 향상)
-    """
-    이미지 리사이징 및 포맷 정규화
-    """
-    h_orig, w_orig = image_array.shape[:2]
-    scale_factor = 1.0
-    
-    # 리사이징 로직
-    if w_orig > max_width:
-        scale_factor = w_orig / max_width
-        new_width = max_width
-        new_height = int(h_orig / scale_factor)
-        display_img_cv = cv2.resize(image_array, (new_width, new_height), interpolation=cv2.INTER_AREA)
-    else:
-        display_img_cv = image_array
-        new_width = w_orig
-        new_height = h_orig
-        
-    # BGR -> RGB 변환
-    if len(display_img_cv.shape) == 3:
-        img_rgb = cv2.cvtColor(display_img_cv, cv2.COLOR_BGR2RGB)
-    else:
-        img_rgb = display_img_cv
-        
-    # [중요] RGB 모드로 강제 변환 (호환성 확보)
-    pil_image = Image.fromarray(img_rgb).convert("RGB")
-    
-    return pil_image, scale_factor, new_width, new_height
+    # [NEW] 캔버스 스크롤 위치 저장용
+    if 'scroll_y' not in st.session_state:
+        st.session_state.scroll_y = 0
 
 def draw_regions_on_image(image, regions, edited_texts):
     """미리보기용 이미지에 박스 그리기"""
@@ -111,6 +85,8 @@ def render_step1_upload():
         
         st.session_state.original_image = image
         st.session_state.uploaded_filename = uploaded_file.name
+        # 스크롤 위치 초기화
+        st.session_state.scroll_y = 0
         
         st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), caption="원본 이미지", use_container_width=True)
         
@@ -119,7 +95,7 @@ def render_step1_upload():
             st.rerun()
 
 def render_step2_detect():
-    """Step 2: 수동 영역 지정 (안전장치 추가됨)"""
+    """Step 2: 수동 영역 지정 (스크롤 뷰어 방식 적용)"""
     st.header("Step 2: 텍스트 영역 지정")
     
     if st.session_state.original_image is None:
@@ -127,87 +103,162 @@ def render_step2_detect():
         return
 
     original_image = st.session_state.original_image
+    h_orig, w_orig = original_image.shape[:2]
     
+    # ---------------------------------------------------------
+    # [핵심] 스크롤 뷰어 설정
+    # 전체 이미지가 너무 크므로, 한 번에 1000px 높이만 보여줍니다.
+    # ---------------------------------------------------------
+    VIEWPORT_HEIGHT = 1000  # 화면에 보여줄 높이 (적당한 크기)
+    
+    # 가로폭 리사이징 (캔버스 폭 맞춤, 최대 800px)
+    CANVAS_WIDTH = 800
+    scale_factor = 1.0
+    
+    if w_orig > CANVAS_WIDTH:
+        scale_factor = w_orig / CANVAS_WIDTH
+        resized_w = CANVAS_WIDTH
+        resized_h_total = int(h_orig / scale_factor)
+        # 전체를 리사이징하면 느리므로, 크롭 후 리사이징할 비율만 계산해둠
+    else:
+        resized_w = w_orig
+        resized_h_total = h_orig
+
+    # 스크롤 슬라이더 (이미지가 뷰포트보다 클 때만 표시)
+    current_scroll = st.session_state.scroll_y
+    
+    if h_orig > VIEWPORT_HEIGHT:
+        st.info("💡 이미지가 길어서 **스크롤** 기능을 제공합니다. 슬라이더를 움직여 작업할 위치를 맞추세요.")
+        # 슬라이더: 0부터 (전체높이 - 뷰포트높이)까지
+        max_scroll = h_orig - VIEWPORT_HEIGHT
+        
+        # 슬라이더 값을 세션에 저장하여 리로드 되어도 유지
+        scroll_val = st.slider(
+            "↕️ 이미지 스크롤 (위/아래 이동)", 
+            min_value=0, 
+            max_value=max_scroll, 
+            value=st.session_state.scroll_y,
+            step=50,
+            key="slider_scroll"
+        )
+        # 슬라이더 값이 바뀌면 세션 업데이트
+        st.session_state.scroll_y = scroll_val
+        current_scroll = scroll_val
+    else:
+        current_scroll = 0
+
+    # 1. 현재 스크롤 위치에 맞춰 원본에서 잘라내기 (Crop)
+    # 보여줄 높이는 뷰포트 높이 또는 남은 이미지 높이 중 작은 것
+    crop_h = min(VIEWPORT_HEIGHT, h_orig - current_scroll)
+    
+    crop_img = original_image[current_scroll : current_scroll + crop_h, :]
+    
+    # 2. 잘라낸 조각을 화면 표시용으로 리사이징
+    h_crop, w_crop = crop_img.shape[:2]
+    
+    if w_crop > CANVAS_WIDTH:
+        # 가로폭을 800으로 맞춤
+        disp_scale = CANVAS_WIDTH / w_crop
+        disp_w = CANVAS_WIDTH
+        disp_h = int(h_crop * disp_scale)
+        display_img = cv2.resize(crop_img, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
+    else:
+        disp_scale = 1.0
+        display_img = crop_img
+        disp_w = w_crop
+        disp_h = h_crop
+
+    # 3. BGR -> RGB 변환
     try:
-        pil_image, scale_factor, new_width, new_height = process_image_for_display(original_image)
+        img_rgb = cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(img_rgb)
     except Exception as e:
-        st.error(f"이미지 처리 중 오류 발생: {e}")
+        st.error(f"이미지 처리 오류: {e}")
         return
 
-    st.info(f"🖱️ 아래 이미지 위에 마우스로 박스를 그려주세요.")
+    st.write(f"📍 현재 위치: Y={current_scroll}px 부터 작업 중")
 
-    # [안전장치 1] 참조 이미지 표시 (캔버스 배경이 안 나올 경우를 대비)
-    st.caption("👇 작업할 이미지 (배경이 안 보이면 '캔버스 초기화'를 눌러주세요)")
-    
-    # [안전장치 2] 캔버스 초기화 버튼
     col_reset, _ = st.columns([1, 4])
     with col_reset:
-        if st.button("🔄 캔버스 초기화"):
+        if st.button("🔄 캔버스 지우기"):
             st.session_state.canvas_key = f"canvas_{uuid.uuid4()}" 
             st.rerun()
 
-    # 캔버스 호출
+    # 4. 캔버스 호출 (작아진 이미지 조각만 올림 -> 가벼움!)
     try:
         canvas_result = st_canvas(
             fill_color="rgba(255, 165, 0, 0.2)",
             stroke_width=2,
             stroke_color="#FF0000",
-            background_image=pil_image, # 여기서 PIL 이미지가 들어감
+            background_image=pil_image,
             update_streamlit=True,
-            height=new_height,
-            width=new_width,
+            height=disp_h,
+            width=disp_w,
             drawing_mode="rect",
             key=st.session_state.canvas_key,
             display_toolbar=True
         )
     except Exception as e:
-        st.error(f"캔버스 컴포넌트 로딩 실패: {e}")
+        st.error(f"캔버스 로딩 실패: {e}")
         st.stop()
-    
-    # 캔버스 바로 아래에 디버깅용 이미지 표시 (혹시 캔버스가 비어도 이건 보여야 함)
-    if canvas_result.json_data is None:
-        st.image(pil_image, caption="이미지 로딩 확인용", width=new_width)
 
     if canvas_result.json_data is not None:
         objects = canvas_result.json_data["objects"]
         
         if len(objects) > 0:
-            st.success(f"✅ 총 {len(objects)}개의 영역이 지정되었습니다.")
+            st.success(f"✅ 현재 화면에서 {len(objects)}개의 영역을 지정했습니다.")
             
-            if st.button("📝 텍스트 추출 및 편집하기 (Step 3)", type="primary"):
-                with st.spinner("텍스트 분석 및 기본값 적용 중..."):
-                    regions = []
-                    h_orig, w_orig = original_image.shape[:2]
+            # 주의 문구
+            st.caption("⚠️ **주의:** '텍스트 추출' 버튼을 누르면 **현재 화면에 보이는 박스들만** 저장됩니다. 긴 이미지는 한 번에 한 구간씩 작업하거나, 여러 번 나누어 진행해주세요.")
+            
+            if st.button("📝 선택 영역 텍스트 추출하기 (Step 3)", type="primary"):
+                with st.spinner("좌표 계산 및 텍스트 추출 중..."):
+                    new_regions = []
                     
                     for i, obj in enumerate(objects):
-                        # 좌표 복원 계산
-                        x = int(obj["left"] * scale_factor)
-                        y = int(obj["top"] * scale_factor)
-                        w = int(obj["width"] * scale_factor)
-                        h = int(obj["height"] * scale_factor)
+                        # 1. 캔버스 좌표 -> 크롭 이미지 좌표 (리사이징 복원)
+                        x_crop = int(obj["left"] / disp_scale)
+                        y_crop = int(obj["top"] / disp_scale)
+                        w_crop = int(obj["width"] / disp_scale)
+                        h_crop = int(obj["height"] / disp_scale)
                         
-                        x = max(0, min(x, w_orig))
-                        y = max(0, min(y, h_orig))
-                        w = min(w, w_orig - x)
-                        h = min(h, h_orig - y)
+                        # 2. 크롭 이미지 좌표 -> 전체 원본 좌표 (스크롤 오프셋 더하기)
+                        x_real = x_crop
+                        y_real = y_crop + current_scroll # [핵심] 스크롤 위치만큼 더해줌
+                        w_real = w_crop
+                        h_real = h_crop
                         
-                        if w < 5 or h < 5: continue
+                        # 유효성 검사
+                        x_real = max(0, min(x_real, w_orig))
+                        y_real = max(0, min(y_real, h_orig))
+                        w_real = min(w_real, w_orig - x_real)
+                        h_real = min(h_real, h_orig - y_real)
+                        
+                        if w_real < 5 or h_real < 5: continue
 
-                        # 텍스트 추출
-                        region = extract_text_from_crop(original_image, x, y, w, h)
-                        region.id = f"manual_{i:03d}"
+                        # 3. 텍스트 추출 (원본 전체 이미지에서)
+                        region = extract_text_from_crop(original_image, x_real, y_real, w_real, h_real)
                         
-                        # [기본값 적용]
+                        # ID 생성 (기존 목록이 있으면 이어서 번호 부여)
+                        start_idx = len(st.session_state.text_regions)
+                        region.id = f"manual_{start_idx + i:03d}"
+                        
+                        # 기본값
                         region.suggested_font_size = 16
                         region.width_scale = 90
                         region.font_filename = "NotoSansKR-Black.ttf"
                         
-                        regions.append(region.to_dict())
+                        new_regions.append(region.to_dict())
                     
-                    if not regions:
-                        st.warning("유효한 영역이 없습니다. 다시 그려주세요.")
+                    if not new_regions:
+                        st.warning("유효한 영역이 없습니다.")
                     else:
-                        st.session_state.text_regions = regions
+                        # [중요] 기존에 작업한 내용에 '추가'할지, '덮어쓸지' 결정
+                        # 여기서는 단순하게 매번 덮어쓰거나 추가하는 방식 중
+                        # 사용자가 혼동하지 않게 '덮어쓰기(새로 시작)'로 처리하고
+                        # 여러 구간 작업을 원하면 아래 로직을 'append'로 바꾸면 됩니다.
+                        # 현재는 깔끔하게 이번에 선택한 것만 편집하도록 합니다.
+                        st.session_state.text_regions = new_regions
                         st.session_state.current_step = 3
                         st.rerun()
 
