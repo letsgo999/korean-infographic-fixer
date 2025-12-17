@@ -194,7 +194,7 @@ def render_step2_detect():
                         # [기본값 적용: 16px, 90%, Black]
                         region.suggested_font_size = 16
                         region.width_scale = 90
-                        region.font_filename = "NotoSansKR-Bold.ttf"
+                        region.font_filename = "NotoSansKR-Black.ttf"
                         
                         regions.append(region.to_dict())
                     
