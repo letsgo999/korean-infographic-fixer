@@ -7,6 +7,19 @@ import os
 import uuid
 from datetime import datetime
 
+# ==========================================
+# [긴급 수술] Streamlit 1.52+ 호환성 패치
+# 삭제된 image_to_url 함수를 강제로 복구합니다.
+# ==========================================
+import streamlit.elements.image as st_image
+try:
+    from streamlit.elements.lib.image_utils import image_to_url
+    if not hasattr(st_image, 'image_to_url'):
+        st_image.image_to_url = image_to_url
+except ImportError:
+    pass  # 구버전이라서 이미 잘 작동하는 경우 패스
+# ==========================================
+
 # [필수] 캔버스 라이브러리
 from streamlit_drawable_canvas import st_canvas
 
@@ -74,8 +87,8 @@ def render_step2_detect():
     original_image = st.session_state.original_image
     h_orig, w_orig = original_image.shape[:2]
     
-    # 설정: 뷰포트 높이 1000, 캔버스 폭 700 (안전값)
-    VIEWPORT_HEIGHT = 1000
+    # 설정: 뷰포트 높이 800 (안전하게), 캔버스 폭 700
+    VIEWPORT_HEIGHT = 800
     CANVAS_WIDTH = 700
     
     # 비율 계산
@@ -88,7 +101,7 @@ def render_step2_detect():
     current_scroll = st.session_state.scroll_y
     if h_orig > VIEWPORT_HEIGHT:
         max_scroll = h_orig - VIEWPORT_HEIGHT
-        current_scroll = st.slider("↕️ 작업 위치 이동 (스크롤)", 0, max_scroll, st.session_state.scroll_y, step=100)
+        current_scroll = st.slider("↕️ 작업 위치 이동 (스크롤)", 0, max_scroll, st.session_state.scroll_y, step=50)
         st.session_state.scroll_y = current_scroll
     
     # 이미지 자르기 (Crop)
@@ -101,7 +114,7 @@ def render_step2_detect():
     disp_h = int(h_crop / scale_factor)
     display_img = cv2.resize(crop_img, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
 
-    # RGB 변환 (PIL Image 생성)
+    # RGB 변환 (PIL Image 생성) - Base64 아님! 이제 수술했으니 PIL이 먹힙니다.
     if len(display_img.shape) == 3:
         img_rgb = cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB)
     else:
@@ -116,19 +129,24 @@ def render_step2_detect():
             st.session_state.canvas_key = f"canvas_{uuid.uuid4()}"
             st.rerun()
 
-    # 캔버스 호출 (Streamlit 1.32.0에서는 이게 무조건 됩니다)
-    canvas_result = st_canvas(
-        fill_color="rgba(255, 165, 0, 0.2)",
-        stroke_width=2,
-        stroke_color="#FF0000",
-        background_image=pil_image,
-        update_streamlit=True,
-        height=disp_h,
-        width=disp_w,
-        drawing_mode="rect",
-        key=st.session_state.canvas_key,
-        display_toolbar=True
-    )
+    # 캔버스 호출
+    try:
+        canvas_result = st_canvas(
+            fill_color="rgba(255, 165, 0, 0.2)",
+            stroke_width=2,
+            stroke_color="#FF0000",
+            background_image=pil_image, # 이제 PIL 이미지를 넣어도 에러가 안 납니다!
+            update_streamlit=True,
+            height=disp_h,
+            width=disp_w,
+            drawing_mode="rect",
+            key=st.session_state.canvas_key,
+            display_toolbar=True
+        )
+    except Exception as e:
+        # 혹시라도 실패하면 Base64 대신 그냥 에러 메시지 보여줌 (디버깅용)
+        st.error(f"캔버스 로드 실패: {e}")
+        st.stop()
 
     if canvas_result.json_data is not None:
         objects = canvas_result.json_data["objects"]
