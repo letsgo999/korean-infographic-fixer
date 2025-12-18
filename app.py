@@ -9,38 +9,36 @@ import base64
 from datetime import datetime
 
 # ==============================================================================
-# [🚑 긴급 호환성 패치] Streamlit 1.52+ 대응 코드
-# 캔버스 라이브러리가 찾는 'image_to_url' 함수가 없으면, 강제로 만들어서 주입합니다.
-# 이 코드가 있으면 서버 버전이 무엇이든 상관없이 에러가 사라집니다.
+# [필수 호환성 패치] 
+# 주의: 이 코드는 반드시 'streamlit_drawable_canvas' 임포트보다 위에 있어야 합니다.
+# Streamlit 1.52+ 버전에서 삭제된 'image_to_url' 기능을 수동으로 복구합니다.
 # ==============================================================================
 import streamlit.elements.image
 
-if not hasattr(streamlit.elements.image, 'image_to_url'):
-    def custom_image_to_url(image, width=None, clamp=False, channels="RGB", output_format="JPEG", image_id=None):
-        """
-        삭제된 image_to_url 기능을 대체하는 함수입니다.
-        이미지를 받아서 캔버스가 이해할 수 있는 URL 문자로 변환해줍니다.
-        """
-        # 1. Numpy 배열(OpenCV) 대응
-        if isinstance(image, np.ndarray):
-            image = Image.fromarray(image)
-            
-        # 2. RGB 변환 (JPEG 호환성)
-        if output_format.upper() == "JPEG" and image.mode == "RGBA":
-            image = image.convert("RGB")
-            
-        # 3. 메모리 버퍼에 저장 후 Base64 변환
-        with io.BytesIO() as buffer:
-            image.save(buffer, format=output_format)
-            encoded = base64.b64encode(buffer.getvalue()).decode()
-            
-        return f"data:image/{output_format.lower()};base64,{encoded}"
+# 삭제된 기능을 대체할 함수 정의
+def local_image_to_url(image, width=None, clamp=False, channels="RGB", output_format="JPEG", image_id=None):
+    """
+    Streamlit 내부 함수 image_to_url을 대체하여,
+    이미지를 Base64 URL로 변환해주는 함수입니다.
+    """
+    # 1. 포맷 보정
+    if output_format.upper() == "JPEG" and image.mode == "RGBA":
+        image = image.convert("RGB")
+        
+    # 2. 메모리 버퍼에 저장
+    with io.BytesIO() as buffer:
+        image.save(buffer, format=output_format)
+        encoded = base64.b64encode(buffer.getvalue()).decode()
+        
+    # 3. 데이터 URL 반환
+    return f"data:image/{output_format.lower()};base64,{encoded}"
 
-    # 강제 주입 (Monkey Patch)
-    streamlit.elements.image.image_to_url = custom_image_to_url
+# 강제로 함수 주입 (기존에 없으면 덮어씌움)
+if not hasattr(streamlit.elements.image, 'image_to_url'):
+    streamlit.elements.image.image_to_url = local_image_to_url
 # ==============================================================================
 
-# [필수] 캔버스 라이브러리 (이제 위 패치 덕분에 안전하게 작동합니다)
+# [중요] 패치가 완료된 후에 라이브러리를 임포트해야 합니다.
 from streamlit_drawable_canvas import st_canvas
 
 # Modules
@@ -107,17 +105,15 @@ def render_step2_detect():
     original_image = st.session_state.original_image
     h_orig, w_orig = original_image.shape[:2]
     
-    # 뷰포트 설정 (높이 1000px, 폭 700px)
+    # 뷰포트 설정
     VIEWPORT_HEIGHT = 1000
     CANVAS_WIDTH = 700
     
-    # 비율 계산
     if w_orig > CANVAS_WIDTH:
         scale_factor = w_orig / CANVAS_WIDTH
     else:
         scale_factor = 1.0
 
-    # 스크롤 슬라이더
     current_scroll = st.session_state.scroll_y
     if h_orig > VIEWPORT_HEIGHT:
         st.info("💡 이미지가 길어서 부분적으로 표시합니다. 슬라이더로 작업 위치를 이동하세요.")
@@ -135,7 +131,7 @@ def render_step2_detect():
     disp_h = int(h_crop / scale_factor)
     display_img = cv2.resize(crop_img, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
 
-    # RGB 변환 (PIL Image 생성)
+    # RGB 변환 및 PIL 이미지 생성
     if len(display_img.shape) == 3:
         img_rgb = cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB)
     else:
@@ -150,13 +146,15 @@ def render_step2_detect():
             st.session_state.canvas_key = f"canvas_{uuid.uuid4()}"
             st.rerun()
 
-    # 캔버스 호출 (이제 패치 덕분에 안전하게 호출됩니다)
+    # 캔버스 호출
+    # 이제 위에서 정의한 local_image_to_url 함수 덕분에,
+    # st_canvas 내부에서 'image_to_url'을 찾을 때 우리가 만든 함수가 대신 작동합니다.
     try:
         canvas_result = st_canvas(
             fill_color="rgba(255, 165, 0, 0.2)",
             stroke_width=2,
             stroke_color="#FF0000",
-            background_image=pil_image, # PIL Image 전달
+            background_image=pil_image,
             update_streamlit=True,
             height=disp_h,
             width=disp_w,
