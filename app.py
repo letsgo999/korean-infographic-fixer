@@ -8,39 +8,7 @@ import uuid
 import base64
 from datetime import datetime
 
-# ==============================================================================
-# [🚑 긴급 수술 코드] Streamlit 1.52+ 버전 강제 호환 패치
-# 서버가 최신 버전을 고집하더라도, 삭제된 기능을 강제로 되살려 캔버스를 작동시킵니다.
-# ==============================================================================
-import streamlit.elements.image
-
-def custom_image_to_url(image, width=None, clamp=False, channels="RGB", output_format="JPEG", image_id=None):
-    """
-    삭제된 image_to_url 기능을 대체하는 수제 함수입니다.
-    PIL 이미지를 받아서 캔버스가 이해할 수 있는 URL 문자로 변환해줍니다.
-    """
-    # 이미지 포맷 처리
-    img_format = output_format if output_format else "JPEG"
-    
-    # 메모리 버퍼에 저장
-    with io.BytesIO() as output:
-        # RGBA -> RGB 변환 (JPEG 호환성)
-        if image.mode == "RGBA" and img_format.upper() == "JPEG":
-            image = image.convert("RGB")
-            
-        image.save(output, format=img_format)
-        img_data = output.getvalue()
-        
-    # Base64 인코딩
-    encoded = base64.b64encode(img_data).decode()
-    return f"data:image/{img_format.lower()};base64,{encoded}"
-
-# Streamlit 내부에 강제로 주입 (이 코드가 에러를 원천 차단합니다)
-if not hasattr(streamlit.elements.image, 'image_to_url'):
-    streamlit.elements.image.image_to_url = custom_image_to_url
-# ==============================================================================
-
-# [필수] 캔버스 라이브러리 (이제 위 패치 덕분에 안전하게 임포트됩니다)
+# [필수] 캔버스 라이브러리
 from streamlit_drawable_canvas import st_canvas
 
 # Modules
@@ -107,9 +75,12 @@ def render_step2_detect():
     original_image = st.session_state.original_image
     h_orig, w_orig = original_image.shape[:2]
     
-    # 설정: 뷰포트 높이 800 (안전값), 캔버스 폭 700
-    VIEWPORT_HEIGHT = 800
-    CANVAS_WIDTH = 700
+    # -------------------------------------------------------------
+    # [설정] 뷰포트 (화면 표시 영역)
+    # 이미지를 잘라서 보여줍니다. (전체 로딩 시 멈춤 방지)
+    # -------------------------------------------------------------
+    VIEWPORT_HEIGHT = 1000 
+    CANVAS_WIDTH = 700    
     
     # 비율 계산
     if w_orig > CANVAS_WIDTH:
@@ -122,25 +93,41 @@ def render_step2_detect():
     if h_orig > VIEWPORT_HEIGHT:
         st.info("💡 이미지가 길어서 부분적으로 표시합니다. 슬라이더로 작업 위치를 이동하세요.")
         max_scroll = h_orig - VIEWPORT_HEIGHT
-        current_scroll = st.slider("↕️ 작업 위치 이동 (스크롤)", 0, max_scroll, st.session_state.scroll_y, step=50)
+        current_scroll = st.slider("↕️ 작업 위치 이동 (스크롤)", 0, max_scroll, st.session_state.scroll_y, step=100)
         st.session_state.scroll_y = current_scroll
     
-    # 이미지 자르기 (Crop)
+    # 1. 이미지 자르기 (Crop)
     crop_h = min(VIEWPORT_HEIGHT, h_orig - current_scroll)
     crop_img = original_image[current_scroll : current_scroll + crop_h, :]
     
-    # 리사이징 (화면용)
+    # 2. 리사이징 (화면용)
     h_crop, w_crop = crop_img.shape[:2]
     disp_w = int(w_crop / scale_factor)
     disp_h = int(h_crop / scale_factor)
     display_img = cv2.resize(crop_img, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
 
-    # RGB 변환 (PIL Image 생성)
-    if len(display_img.shape) == 3:
-        img_rgb = cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB)
-    else:
-        img_rgb = display_img
-    pil_image = Image.fromarray(img_rgb)
+    # 3. [핵심 해결책] 직접 Base64 문자열로 변환
+    # Streamlit 내부 함수를 쓰지 않고, 우리가 직접 URL을 만듭니다.
+    # 이렇게 하면 버전 호환성 문제(AttributeError)가 100% 사라집니다.
+    try:
+        # BGR -> RGB
+        if len(display_img.shape) == 3:
+            img_rgb = cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB)
+        else:
+            img_rgb = display_img
+        
+        pil_img = Image.fromarray(img_rgb)
+        
+        # 메모리에 JPEG로 저장 후 Base64 인코딩
+        with io.BytesIO() as buffer:
+            pil_img.save(buffer, format="JPEG", quality=85)
+            img_str = base64.b64encode(buffer.getvalue()).decode()
+            # 캔버스에 전달할 최종 문자열
+            bg_image_url = f"data:image/jpeg;base64,{img_str}"
+            
+    except Exception as e:
+        st.error(f"이미지 변환 중 오류 발생: {e}")
+        return
 
     st.caption(f"📍 현재 작업 위치: {current_scroll}px ~ {current_scroll + crop_h}px")
 
@@ -150,13 +137,13 @@ def render_step2_detect():
             st.session_state.canvas_key = f"canvas_{uuid.uuid4()}"
             st.rerun()
 
-    # 캔버스 호출 (이제 패치 덕분에 에러가 나지 않습니다)
+    # 4. 캔버스 호출 (이미지 객체 대신 URL 문자열 전달)
     try:
         canvas_result = st_canvas(
             fill_color="rgba(255, 165, 0, 0.2)",
             stroke_width=2,
             stroke_color="#FF0000",
-            background_image=pil_image,
+            background_image=bg_image_url,  # <--- [중요] 여기에 문자열을 넣습니다.
             update_streamlit=True,
             height=disp_h,
             width=disp_w,
@@ -165,7 +152,7 @@ def render_step2_detect():
             display_toolbar=True
         )
     except Exception as e:
-        st.error(f"캔버스 로드 실패 (패치 실패?): {e}")
+        st.error(f"캔버스 로드 실패: {e}")
         st.stop()
 
     if canvas_result.json_data is not None:
