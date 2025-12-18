@@ -2,10 +2,10 @@
 # Streamlit Cloud Compatible Version
 
 # Web Framework
-streamlit
+streamlit==1.42.0
 
 # Mouse Drag Text Area Select
-streamlit-drawable-canvas
+streamlit-drawable-canvas==0.9.3
 
 # Image Processing
 opencv-python-headless
