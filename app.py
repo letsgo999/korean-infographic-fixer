@@ -75,42 +75,38 @@ def render_step2_detect():
     original_image = st.session_state.original_image
     h_orig, w_orig = original_image.shape[:2]
     
-    # -------------------------------------------------------------
-    # [설정] 뷰포트 (화면 표시 영역)
-    # 이미지를 잘라서 보여줍니다. (전체 로딩 시 멈춤 방지)
-    # -------------------------------------------------------------
-    VIEWPORT_HEIGHT = 1000 
-    CANVAS_WIDTH = 700    
+    # 뷰포트 설정
+    VIEWPORT_HEIGHT = 1000
+    CANVAS_WIDTH = 700
     
-    # 비율 계산
     if w_orig > CANVAS_WIDTH:
         scale_factor = w_orig / CANVAS_WIDTH
     else:
         scale_factor = 1.0
 
-    # 스크롤 슬라이더
     current_scroll = st.session_state.scroll_y
     if h_orig > VIEWPORT_HEIGHT:
-        st.info("💡 이미지가 길어서 부분적으로 표시합니다. 슬라이더로 작업 위치를 이동하세요.")
+        st.info("💡 이미지가 길어서 부분적으로 표시합니다. 슬라이더로 이동하세요.")
         max_scroll = h_orig - VIEWPORT_HEIGHT
-        current_scroll = st.slider("↕️ 작업 위치 이동 (스크롤)", 0, max_scroll, st.session_state.scroll_y, step=100)
+        current_scroll = st.slider("↕️ 작업 위치 이동", 0, max_scroll, st.session_state.scroll_y, step=100)
         st.session_state.scroll_y = current_scroll
     
-    # 1. 이미지 자르기 (Crop)
+    # 이미지 자르기
     crop_h = min(VIEWPORT_HEIGHT, h_orig - current_scroll)
     crop_img = original_image[current_scroll : current_scroll + crop_h, :]
     
-    # 2. 리사이징 (화면용)
+    # 리사이징
     h_crop, w_crop = crop_img.shape[:2]
     disp_w = int(w_crop / scale_factor)
     disp_h = int(h_crop / scale_factor)
     display_img = cv2.resize(crop_img, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
 
-    # 3. [핵심 해결책] 직접 Base64 문자열로 변환
-    # Streamlit 내부 함수를 쓰지 않고, 우리가 직접 URL을 만듭니다.
-    # 이렇게 하면 버전 호환성 문제(AttributeError)가 100% 사라집니다.
+    # -------------------------------------------------------------
+    # [최후의 수단] 직접 Base64 변환 (버전 호환성 문제 100% 회피)
+    # Streamlit 함수를 거치지 않고, 우리가 직접 문자열을 만듭니다.
+    # -------------------------------------------------------------
     try:
-        # BGR -> RGB
+        # 1. BGR -> RGB
         if len(display_img.shape) == 3:
             img_rgb = cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB)
         else:
@@ -118,11 +114,11 @@ def render_step2_detect():
         
         pil_img = Image.fromarray(img_rgb)
         
-        # 메모리에 JPEG로 저장 후 Base64 인코딩
+        # 2. 메모리에 JPEG로 저장 후 문자열(Base64)로 변환
         with io.BytesIO() as buffer:
             pil_img.save(buffer, format="JPEG", quality=85)
             img_str = base64.b64encode(buffer.getvalue()).decode()
-            # 캔버스에 전달할 최종 문자열
+            # 캔버스에 전달할 최종 문자열 URL
             bg_image_url = f"data:image/jpeg;base64,{img_str}"
             
     except Exception as e:
@@ -137,13 +133,13 @@ def render_step2_detect():
             st.session_state.canvas_key = f"canvas_{uuid.uuid4()}"
             st.rerun()
 
-    # 4. 캔버스 호출 (이미지 객체 대신 URL 문자열 전달)
+    # 캔버스 호출 (이미지 객체 대신 '문자열'을 전달 -> 에러 원천 차단)
     try:
         canvas_result = st_canvas(
             fill_color="rgba(255, 165, 0, 0.2)",
             stroke_width=2,
             stroke_color="#FF0000",
-            background_image=bg_image_url,  # <--- [중요] 여기에 문자열을 넣습니다.
+            background_image=bg_image_url,  # <--- [핵심] 문자열 전달
             update_streamlit=True,
             height=disp_h,
             width=disp_w,
