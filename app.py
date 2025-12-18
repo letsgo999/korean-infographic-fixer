@@ -4,10 +4,8 @@ import numpy as np
 from PIL import Image
 import io
 import os
-import tempfile
-from datetime import datetime
-from pathlib import Path
 import uuid
+from datetime import datetime
 
 # [필수] 캔버스 라이브러리
 from streamlit_drawable_canvas import st_canvas
@@ -19,8 +17,7 @@ from modules import (
     apply_styles_and_colors,
     CompositeRenderer,
     MultiFormatExporter,
-    MetadataBuilder,
-    create_manual_region
+    MetadataBuilder
 )
 
 # 페이지 설정
@@ -77,73 +74,61 @@ def render_step2_detect():
     original_image = st.session_state.original_image
     h_orig, w_orig = original_image.shape[:2]
     
-    # -----------------------------------------------------------
-    # [설정] 안전한 뷰포트 크기 (높이 800px, 폭 600px)
-    # 이 정도로 작게 잘라야 웹소켓이 터지지 않습니다.
-    # -----------------------------------------------------------
-    VIEWPORT_HEIGHT = 800 
-    CANVAS_WIDTH = 600    
+    # 설정: 뷰포트 높이 1000, 캔버스 폭 700 (안전값)
+    VIEWPORT_HEIGHT = 1000
+    CANVAS_WIDTH = 700
     
-    # 리사이징 비율 계산
+    # 비율 계산
     if w_orig > CANVAS_WIDTH:
         scale_factor = w_orig / CANVAS_WIDTH
     else:
         scale_factor = 1.0
-        
-    # 슬라이더 (이미지가 길면 표시)
+
+    # 스크롤 슬라이더
     current_scroll = st.session_state.scroll_y
     if h_orig > VIEWPORT_HEIGHT:
-        st.info(f"📏 이미지가 길어서 부분적으로 표시합니다. 아래 슬라이더로 작업 위치를 이동하세요.")
         max_scroll = h_orig - VIEWPORT_HEIGHT
-        # 슬라이더 스텝을 50px로 하여 정밀 이동 가능하게 함
-        current_scroll = st.slider("↕️ 작업 위치 이동 (스크롤)", 0, max_scroll, st.session_state.scroll_y, step=50)
+        current_scroll = st.slider("↕️ 작업 위치 이동 (스크롤)", 0, max_scroll, st.session_state.scroll_y, step=100)
         st.session_state.scroll_y = current_scroll
     
-    # 1. 화면에 보여줄 부분만 잘라내기 (Crop)
+    # 이미지 자르기 (Crop)
     crop_h = min(VIEWPORT_HEIGHT, h_orig - current_scroll)
     crop_img = original_image[current_scroll : current_scroll + crop_h, :]
     
-    # 2. 리사이징 (화면 표시용)
+    # 리사이징 (화면용)
     h_crop, w_crop = crop_img.shape[:2]
     disp_w = int(w_crop / scale_factor)
     disp_h = int(h_crop / scale_factor)
-    
     display_img = cv2.resize(crop_img, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
 
-    # 3. [에러 해결] PIL Image 객체 생성 (Base64 아님!)
-    # 반드시 RGB 모드로 변환해야 캔버스 오류가 안 납니다.
+    # RGB 변환 (PIL Image 생성)
     if len(display_img.shape) == 3:
         img_rgb = cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB)
     else:
         img_rgb = display_img
-    
-    pil_image = Image.fromarray(img_rgb).convert("RGB") # [중요] Alpha 채널 제거
+    pil_image = Image.fromarray(img_rgb)
 
     st.caption(f"📍 현재 작업 위치: {current_scroll}px ~ {current_scroll + crop_h}px")
 
-    col_reset, _ = st.columns([1, 4])
-    with col_reset:
+    col_btn, _ = st.columns([1, 4])
+    with col_btn:
         if st.button("🔄 캔버스 리셋"):
             st.session_state.canvas_key = f"canvas_{uuid.uuid4()}"
             st.rerun()
 
-    # 4. 캔버스 호출 (이제 PIL Image를 넘기므로 AttributeError 안 남)
-    try:
-        canvas_result = st_canvas(
-            fill_color="rgba(255, 165, 0, 0.2)",
-            stroke_width=2,
-            stroke_color="#FF0000",
-            background_image=pil_image,  # [확인] PIL Image 객체 전달
-            update_streamlit=True,
-            height=disp_h,
-            width=disp_w,
-            drawing_mode="rect",
-            key=st.session_state.canvas_key,
-            display_toolbar=True
-        )
-    except Exception as e:
-        st.error(f"캔버스 로드 오류: {e}")
-        st.stop()
+    # 캔버스 호출 (Streamlit 1.32.0에서는 이게 무조건 됩니다)
+    canvas_result = st_canvas(
+        fill_color="rgba(255, 165, 0, 0.2)",
+        stroke_width=2,
+        stroke_color="#FF0000",
+        background_image=pil_image,
+        update_streamlit=True,
+        height=disp_h,
+        width=disp_w,
+        drawing_mode="rect",
+        key=st.session_state.canvas_key,
+        display_toolbar=True
+    )
 
     if canvas_result.json_data is not None:
         objects = canvas_result.json_data["objects"]
@@ -151,21 +136,19 @@ def render_step2_detect():
             st.success(f"✅ 선택된 영역: {len(objects)}개")
             
             if st.button("📝 텍스트 추출 및 편집하기 (Step 3)", type="primary"):
-                with st.spinner("텍스트 추출 중..."):
+                with st.spinner("추출 중..."):
                     regions = []
                     for i, obj in enumerate(objects):
-                        # 좌표 복원 (리사이징 비율 + 스크롤 오프셋)
                         x_view = obj["left"] * scale_factor
                         y_view = obj["top"] * scale_factor
                         w_view = obj["width"] * scale_factor
                         h_view = obj["height"] * scale_factor
                         
                         x_real = int(x_view)
-                        y_real = int(y_view + current_scroll) # 스크롤 반영
+                        y_real = int(y_view + current_scroll)
                         w_real = int(w_view)
                         h_real = int(h_view)
                         
-                        # 유효성 체크
                         x_real = max(0, min(x_real, w_orig))
                         y_real = max(0, min(y_real, h_orig))
                         w_real = min(w_real, w_orig - x_real)
@@ -219,12 +202,10 @@ def render_step3_edit():
                             r['text'] = edited; r['suggested_font_size'] = size_sel
                             r['text_color'] = color_sel; r['font_filename'] = font_sel; r['width_scale'] = scale_sel
                     st.success("저장됨"); st.rerun()
-
     with col2:
         st.subheader("미리보기")
         visualized = draw_regions_on_image(image, regions, st.session_state.edited_texts)
         st.image(cv2.cvtColor(visualized, cv2.COLOR_BGR2RGB), use_container_width=True)
-
     st.divider()
     c1, c2 = st.columns(2)
     with c1: 
@@ -242,7 +223,6 @@ def render_step4_export(settings):
         region_text = st.session_state.edited_texts.get(r['id'], r['text'])
         obj = TextRegion(id=r['id'], text=region_text, confidence=r['confidence'], bounds=r['bounds'], is_inverted=r.get('is_inverted', False), is_manual=True, suggested_font_size=r.get('suggested_font_size', 16), text_color=r.get('text_color', '#000000'), bg_color=r.get('bg_color', '#FFFFFF'), font_filename=r.get('font_filename', None), width_scale=r.get('width_scale', 90))
         target_objects.append(obj)
-    
     try:
         from modules import create_inpainter
         inpainter = create_inpainter("simple_fill")
@@ -253,9 +233,7 @@ def render_step4_export(settings):
         is_success, buffer = cv2.imencode(".png", final_image)
         if is_success:
             st.download_button("다운로드", data=buffer.tobytes(), file_name=f"fixed_{datetime.now().strftime('%H%M%S')}.png", mime="image/png")
-    except Exception as e:
-        st.error(f"오류: {e}")
-    
+    except Exception as e: st.error(f"오류: {e}")
     if st.button("처음으로"): st.session_state.current_step = 1; st.rerun()
 
 def main():
