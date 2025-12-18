@@ -3,7 +3,6 @@ import cv2
 import numpy as np
 from PIL import Image
 import io
-import base64
 import os
 import tempfile
 from datetime import datetime
@@ -40,27 +39,6 @@ def init_session_state():
         st.session_state.canvas_key = "canvas_v1"
     if 'scroll_y' not in st.session_state:
         st.session_state.scroll_y = 0
-
-def image_to_base64(image_array, quality=70):
-    """
-    [핵심 기술] 이미지를 고압축 JPEG Base64 문자열로 변환
-    웹소켓 전송량을 획기적으로 줄여서 멈춤 현상을 해결합니다.
-    """
-    # 1. BGR -> RGB
-    if len(image_array.shape) == 3:
-        img_rgb = cv2.cvtColor(image_array, cv2.COLOR_BGR2RGB)
-    else:
-        img_rgb = image_array
-        
-    pil_img = Image.fromarray(img_rgb)
-    
-    # 2. 메모리 버퍼에 JPEG로 저장 (압축률 조절)
-    buffered = io.BytesIO()
-    pil_img.save(buffered, format="JPEG", quality=quality)
-    
-    # 3. Base64 문자열로 변환
-    img_str = base64.b64encode(buffered.getvalue()).decode()
-    return f"data:image/jpeg;base64,{img_str}"
 
 def draw_regions_on_image(image, regions, edited_texts):
     vis_image = image.copy()
@@ -99,9 +77,12 @@ def render_step2_detect():
     original_image = st.session_state.original_image
     h_orig, w_orig = original_image.shape[:2]
     
-    # 뷰포트 설정
-    VIEWPORT_HEIGHT = 1200 # 한 번에 보여줄 높이
-    CANVAS_WIDTH = 700     # 캔버스 가로 폭 (안전하게 700으로 설정)
+    # -----------------------------------------------------------
+    # [설정] 안전한 뷰포트 크기 (높이 800px, 폭 600px)
+    # 이 정도로 작게 잘라야 웹소켓이 터지지 않습니다.
+    # -----------------------------------------------------------
+    VIEWPORT_HEIGHT = 800 
+    CANVAS_WIDTH = 600    
     
     # 리사이징 비율 계산
     if w_orig > CANVAS_WIDTH:
@@ -112,9 +93,10 @@ def render_step2_detect():
     # 슬라이더 (이미지가 길면 표시)
     current_scroll = st.session_state.scroll_y
     if h_orig > VIEWPORT_HEIGHT:
-        st.info(f"📏 전체 높이 {h_orig}px 중 일부만 표시합니다. 슬라이더로 이동하세요.")
+        st.info(f"📏 이미지가 길어서 부분적으로 표시합니다. 아래 슬라이더로 작업 위치를 이동하세요.")
         max_scroll = h_orig - VIEWPORT_HEIGHT
-        current_scroll = st.slider("↕️ 작업 위치 이동 (스크롤)", 0, max_scroll, st.session_state.scroll_y, step=100)
+        # 슬라이더 스텝을 50px로 하여 정밀 이동 가능하게 함
+        current_scroll = st.slider("↕️ 작업 위치 이동 (스크롤)", 0, max_scroll, st.session_state.scroll_y, step=50)
         st.session_state.scroll_y = current_scroll
     
     # 1. 화면에 보여줄 부분만 잘라내기 (Crop)
@@ -128,13 +110,14 @@ def render_step2_detect():
     
     display_img = cv2.resize(crop_img, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
 
-    # 3. [필살기] 이미지를 Base64 문자열로 변환 (캔버스 배경용)
-    # PIL 객체를 직접 넘기지 않고, 텍스트(URL)로 넘겨서 충돌을 방지함
-    try:
-        bg_image_url = image_to_base64(display_img, quality=60) # 품질 60으로 압축
-    except Exception as e:
-        st.error(f"이미지 변환 실패: {e}")
-        return
+    # 3. [에러 해결] PIL Image 객체 생성 (Base64 아님!)
+    # 반드시 RGB 모드로 변환해야 캔버스 오류가 안 납니다.
+    if len(display_img.shape) == 3:
+        img_rgb = cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB)
+    else:
+        img_rgb = display_img
+    
+    pil_image = Image.fromarray(img_rgb).convert("RGB") # [중요] Alpha 채널 제거
 
     st.caption(f"📍 현재 작업 위치: {current_scroll}px ~ {current_scroll + crop_h}px")
 
@@ -144,13 +127,13 @@ def render_step2_detect():
             st.session_state.canvas_key = f"canvas_{uuid.uuid4()}"
             st.rerun()
 
-    # 4. 캔버스 호출 (background_image에 문자열 전달)
+    # 4. 캔버스 호출 (이제 PIL Image를 넘기므로 AttributeError 안 남)
     try:
         canvas_result = st_canvas(
             fill_color="rgba(255, 165, 0, 0.2)",
             stroke_width=2,
             stroke_color="#FF0000",
-            background_image=bg_image_url, # [변경] 객체 대신 URL 문자열 전달
+            background_image=pil_image,  # [확인] PIL Image 객체 전달
             update_streamlit=True,
             height=disp_h,
             width=disp_w,
@@ -168,7 +151,7 @@ def render_step2_detect():
             st.success(f"✅ 선택된 영역: {len(objects)}개")
             
             if st.button("📝 텍스트 추출 및 편집하기 (Step 3)", type="primary"):
-                with st.spinner("추출 중..."):
+                with st.spinner("텍스트 추출 중..."):
                     regions = []
                     for i, obj in enumerate(objects):
                         # 좌표 복원 (리사이징 비율 + 스크롤 오프셋)
@@ -190,7 +173,6 @@ def render_step2_detect():
                         
                         if w_real < 5 or h_real < 5: continue
                         
-                        # 추출
                         region = extract_text_from_crop(original_image, x_real, y_real, w_real, h_real)
                         region.id = f"manual_{i:03d}"
                         region.suggested_font_size = 16
@@ -205,7 +187,6 @@ def render_step2_detect():
 def render_step3_edit():
     st.header("✏️ Step 3: 텍스트 편집")
     if not st.session_state.text_regions: st.warning("데이터 없음"); return
-    
     image = st.session_state.original_image
     regions = st.session_state.text_regions
     fonts_dir = os.path.join(os.path.dirname(__file__), 'fonts')
