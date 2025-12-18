@@ -5,22 +5,42 @@ from PIL import Image
 import io
 import os
 import uuid
+import base64
 from datetime import datetime
 
-# ==========================================
-# [긴급 수술] Streamlit 1.52+ 호환성 패치
-# 삭제된 image_to_url 함수를 강제로 복구합니다.
-# ==========================================
-import streamlit.elements.image as st_image
-try:
-    from streamlit.elements.lib.image_utils import image_to_url
-    if not hasattr(st_image, 'image_to_url'):
-        st_image.image_to_url = image_to_url
-except ImportError:
-    pass  # 구버전이라서 이미 잘 작동하는 경우 패스
-# ==========================================
+# ==============================================================================
+# [🚑 긴급 수술 코드] Streamlit 1.52+ 버전 강제 호환 패치
+# 서버가 최신 버전을 고집하더라도, 삭제된 기능을 강제로 되살려 캔버스를 작동시킵니다.
+# ==============================================================================
+import streamlit.elements.image
 
-# [필수] 캔버스 라이브러리
+def custom_image_to_url(image, width=None, clamp=False, channels="RGB", output_format="JPEG", image_id=None):
+    """
+    삭제된 image_to_url 기능을 대체하는 수제 함수입니다.
+    PIL 이미지를 받아서 캔버스가 이해할 수 있는 URL 문자로 변환해줍니다.
+    """
+    # 이미지 포맷 처리
+    img_format = output_format if output_format else "JPEG"
+    
+    # 메모리 버퍼에 저장
+    with io.BytesIO() as output:
+        # RGBA -> RGB 변환 (JPEG 호환성)
+        if image.mode == "RGBA" and img_format.upper() == "JPEG":
+            image = image.convert("RGB")
+            
+        image.save(output, format=img_format)
+        img_data = output.getvalue()
+        
+    # Base64 인코딩
+    encoded = base64.b64encode(img_data).decode()
+    return f"data:image/{img_format.lower()};base64,{encoded}"
+
+# Streamlit 내부에 강제로 주입 (이 코드가 에러를 원천 차단합니다)
+if not hasattr(streamlit.elements.image, 'image_to_url'):
+    streamlit.elements.image.image_to_url = custom_image_to_url
+# ==============================================================================
+
+# [필수] 캔버스 라이브러리 (이제 위 패치 덕분에 안전하게 임포트됩니다)
 from streamlit_drawable_canvas import st_canvas
 
 # Modules
@@ -87,7 +107,7 @@ def render_step2_detect():
     original_image = st.session_state.original_image
     h_orig, w_orig = original_image.shape[:2]
     
-    # 설정: 뷰포트 높이 800 (안전하게), 캔버스 폭 700
+    # 설정: 뷰포트 높이 800 (안전값), 캔버스 폭 700
     VIEWPORT_HEIGHT = 800
     CANVAS_WIDTH = 700
     
@@ -100,6 +120,7 @@ def render_step2_detect():
     # 스크롤 슬라이더
     current_scroll = st.session_state.scroll_y
     if h_orig > VIEWPORT_HEIGHT:
+        st.info("💡 이미지가 길어서 부분적으로 표시합니다. 슬라이더로 작업 위치를 이동하세요.")
         max_scroll = h_orig - VIEWPORT_HEIGHT
         current_scroll = st.slider("↕️ 작업 위치 이동 (스크롤)", 0, max_scroll, st.session_state.scroll_y, step=50)
         st.session_state.scroll_y = current_scroll
@@ -114,7 +135,7 @@ def render_step2_detect():
     disp_h = int(h_crop / scale_factor)
     display_img = cv2.resize(crop_img, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
 
-    # RGB 변환 (PIL Image 생성) - Base64 아님! 이제 수술했으니 PIL이 먹힙니다.
+    # RGB 변환 (PIL Image 생성)
     if len(display_img.shape) == 3:
         img_rgb = cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB)
     else:
@@ -129,13 +150,13 @@ def render_step2_detect():
             st.session_state.canvas_key = f"canvas_{uuid.uuid4()}"
             st.rerun()
 
-    # 캔버스 호출
+    # 캔버스 호출 (이제 패치 덕분에 에러가 나지 않습니다)
     try:
         canvas_result = st_canvas(
             fill_color="rgba(255, 165, 0, 0.2)",
             stroke_width=2,
             stroke_color="#FF0000",
-            background_image=pil_image, # 이제 PIL 이미지를 넣어도 에러가 안 납니다!
+            background_image=pil_image,
             update_streamlit=True,
             height=disp_h,
             width=disp_w,
@@ -144,8 +165,7 @@ def render_step2_detect():
             display_toolbar=True
         )
     except Exception as e:
-        # 혹시라도 실패하면 Base64 대신 그냥 에러 메시지 보여줌 (디버깅용)
-        st.error(f"캔버스 로드 실패: {e}")
+        st.error(f"캔버스 로드 실패 (패치 실패?): {e}")
         st.stop()
 
     if canvas_result.json_data is not None:
