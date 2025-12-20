@@ -248,27 +248,36 @@ def render_step2_detect():
             # 향상된 OCR 실행
             ocr_results = run_enhanced_ocr(image)
             
-            # 라인 단위 그룹핑
-            all_regions = ocr_results['all_regions']
+            # [수정] 안전한 딕셔너리 접근 - KeyError 방지
+            normal_regions = ocr_results.get('normal_regions', [])
+            inverted_regions = ocr_results.get('inverted_regions', [])
+            all_regions = ocr_results.get('all_regions', normal_regions + inverted_regions)
             
-            # 일반 영역 그룹핑
-            normal_grouped = group_regions_by_lines(ocr_results['normal_regions'])
-            
-            # 역상 영역은 그대로 (이미 파편화되어 있음)
-            # 나중에 수동으로 병합 가능하도록 함
-            
-            # 스타일 및 색상 적용
-            all_grouped = normal_grouped + ocr_results['inverted_regions']
-            styled_regions = apply_styles_and_colors(image, all_grouped)
-            
-            # 세션에 저장
-            st.session_state.text_regions = regions_to_list(styled_regions)
-            
-            st.success(f"✅ {len(styled_regions)}개의 텍스트 영역을 감지했습니다!")
+            # OCR 결과가 비어있는 경우 처리
+            if not all_regions:
+                st.info("💡 자동 감지된 텍스트가 없습니다. 아래에서 수동으로 영역을 추가하거나, 다음 단계로 이동하세요.")
+                st.session_state.text_regions = []
+            else:
+                # 일반 영역 그룹핑
+                normal_grouped = group_regions_by_lines(normal_regions)
+                
+                # 역상 영역은 그대로 (이미 파편화되어 있음)
+                # 나중에 수동으로 병합 가능하도록 함
+                
+                # 스타일 및 색상 적용
+                all_grouped = normal_grouped + inverted_regions
+                styled_regions = apply_styles_and_colors(image, all_grouped)
+                
+                # 세션에 저장
+                st.session_state.text_regions = regions_to_list(styled_regions)
+                
+                st.success(f"✅ {len(styled_regions)}개의 텍스트 영역을 감지했습니다!")
             
         except Exception as e:
+            import traceback
             st.error(f"OCR 실행 중 오류 발생: {e}")
-            return
+            st.code(traceback.format_exc())  # 디버깅용 상세 오류
+            st.session_state.text_regions = []  # 오류 시에도 빈 리스트로 초기화
     
     # 결과 표시
     col1, col2 = st.columns([2, 1])
